@@ -72,3 +72,32 @@ def test_search_no_hybrid_flag_forces_keyword_mode(monkeypatch):
             "hybrid": False,
         }
     ]
+
+
+def test_v2_search_forwards_filters(monkeypatch):
+    calls = []
+
+    class FakeV2Client:
+        def search(self, **kwargs):
+            calls.append(kwargs)
+            return {"status": "ok", "results": []}
+
+    monkeypatch.setattr(cli, "CompanyContextV2Client", FakeV2Client)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["v2", "search", "roadmap", "--type", "drive_doc", "--type", "slack_file", "-n", "5"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls == [
+        {
+            "query": "roadmap",
+            "limit": 5,
+            "types": ["drive_doc", "slack_file"],
+            "occurred_after": None,
+            "occurred_before": None,
+            "channel_ids": None,
+            "file_ids": None,
+        }
+    ]

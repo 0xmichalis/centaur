@@ -13,13 +13,15 @@ use std::time::Duration;
 use codex_app_server_protocol::{ModelListResponse, UserInput};
 use serde_json::{Value, json};
 
+use self::citations::CodexCitationFilter;
 use crate::otel::{TurnStatus as TelemetryTurnStatus, TurnTelemetry};
 use crate::server::{
     BlocksCommand, BlocksState, parse_blocks_line_with_state, usage_span_input_value,
     write_blocks_error,
 };
-use crate::util::write_value;
 use crate::{AppServerRuntime, HarnessServerError, Result};
+
+mod citations;
 
 const CYBER_POLICY_FALLBACK_MODEL: &str = "gpt-daybreak-blue-latest";
 
@@ -104,13 +106,20 @@ impl AppServerRuntime for CodexHarnessServer {
             io::copy(&mut child_stderr, &mut stderr)
         });
 
-        let mut child_stdout = child
+        let child_stdout = child
             .stdout
             .take()
             .ok_or(HarnessServerError::CodexStdoutUnavailable)?;
         {
             let mut stdout = io::stdout().lock();
-            io::copy(&mut child_stdout, &mut stdout)?;
+            let mut citations = CodexCitationFilter::default();
+            for line in io::BufReader::new(child_stdout).lines() {
+                let line = line?;
+                if !line.trim().is_empty() {
+                    citations.write_value(&mut stdout, &serde_json::from_str(&line)?)?;
+                }
+            }
+            citations.finish(&mut stdout)?;
             stdout.flush()?;
         }
 
@@ -332,7 +341,7 @@ fn initialize_codex<W: Write>(
         traceparent,
     )?;
     codex
-        .read_response_or_forward(initialize_id, stdout)
+        .read_response_or_forward(initialize_id, stdout, None)
         .map(|_| ())
 }
 
@@ -355,8 +364,14 @@ fn run_codex_user_turn<W: Write>(
 ) -> Result<()> {
     let (model, model_provider) = model_and_provider;
     if thread_id.is_none() {
-        let thread =
-            start_or_resume_thread(codex, stdout, request_id, &model_provider, traceparent)?;
+        let thread = start_or_resume_thread(
+            codex,
+            stdout,
+            request_id,
+            model.as_deref(),
+            &model_provider,
+            traceparent,
+        )?;
         *thread_id = Some(thread.id);
         *thread_model = thread.model;
         *thread_provider = Some(model_provider.clone());
@@ -418,7 +433,8 @@ fn run_codex_user_turn<W: Write>(
     loop {
         let turn_request_id = next_request_id(request_id);
         codex.send_request(turn_request_id, "turn/start", params.clone(), traceparent)?;
-        let result = codex.read_response_or_forward(turn_request_id, stdout)?;
+        let result =
+            codex.read_response_or_forward(turn_request_id, stdout, Some(&current_thread_id))?;
         let turn_id = result
             .pointer("/turn/id")
             .and_then(Value::as_str)
@@ -443,7 +459,7 @@ fn run_codex_user_turn<W: Write>(
                     // This is also the `CODEX_ENGINE_RETRY_MAX=0` fail-fast path.
                     for value in &withheld {
                         telemetry.observe_wire_value(value);
-                        write_value(stdout, value)?;
+                        codex.citations.write_value(stdout, value)?;
                     }
                     return Ok(());
                 }
@@ -462,6 +478,7 @@ fn run_codex_user_turn<W: Write>(
                         stdout,
                         request_id,
                         CYBER_POLICY_FALLBACK_MODEL,
+                        &current_thread_id,
                         traceparent,
                     ) {
                         Ok(available) => available,
@@ -476,7 +493,7 @@ fn run_codex_user_turn<W: Write>(
                 if !fallback_available {
                     for value in &withheld {
                         telemetry.observe_wire_value(value);
-                        write_value(stdout, value)?;
+                        codex.citations.write_value(stdout, value)?;
                     }
                     return Ok(());
                 }
@@ -503,6 +520,7 @@ fn start_or_resume_thread<W: Write>(
     codex: &mut CodexJsonRpcChild,
     stdout: &mut W,
     request_id: &mut i64,
+    model: Option<&str>,
     model_provider: &str,
     traceparent: Option<&str>,
 ) -> Result<StartedCodexThread> {
@@ -510,7 +528,7 @@ fn start_or_resume_thread<W: Write>(
     let resume = env::var("CODEX_CONTINUE_THREAD_ID")
         .or_else(|_| env::var("AMP_CONTINUE_THREAD_ID"))
         .unwrap_or_default();
-    let (method, params) = if resume.trim().is_empty() {
+    let (method, mut params) = if resume.trim().is_empty() {
         (
             "thread/start",
             json!({
@@ -535,10 +553,17 @@ fn start_or_resume_thread<W: Write>(
             }),
         )
     };
+    // Start the thread on the model its first turn runs. Without this, the
+    // thread starts on config.toml's `model` and switches on its first turn,
+    // and the Responses backend intermittently refuses that first request
+    // with "model '…' is not enabled in …" (400).
+    if let Some(model) = model {
+        params["model"] = Value::String(model.to_owned());
+    }
 
     let id = next_request_id(request_id);
     codex.send_request(id, method, params, traceparent)?;
-    let result = codex.read_response_or_forward(id, stdout)?;
+    let result = codex.read_response_or_forward(id, stdout, None)?;
     started_codex_thread_from_response(&result, method)
 }
 
@@ -563,6 +588,7 @@ struct CodexJsonRpcChild {
     child: Child,
     stdin: ChildStdin,
     stdout: Receiver<io::Result<String>>,
+    citations: CodexCitationFilter,
 }
 
 impl CodexJsonRpcChild {
@@ -614,6 +640,7 @@ impl CodexJsonRpcChild {
             child,
             stdin,
             stdout: stdout_rx,
+            citations: CodexCitationFilter::default(),
         })
     }
 
@@ -658,7 +685,11 @@ impl CodexJsonRpcChild {
         &mut self,
         expected_id: i64,
         stdout: &mut W,
+        thread_id: Option<&str>,
     ) -> Result<Value> {
+        // Notifications can precede the response that identifies the new thread
+        // or turn. Buffer them until ownership is known, including on resume.
+        let mut notifications = Vec::new();
         loop {
             let value = self.read_value()?;
             if is_server_request(&value) {
@@ -671,10 +702,21 @@ impl CodexJsonRpcChild {
                         "Codex app-server request {expected_id} failed: {error}"
                     )));
                 }
-                return Ok(value.get("result").cloned().unwrap_or(Value::Null));
+                let result = value.get("result").cloned().unwrap_or(Value::Null);
+                let thread_id = result
+                    .pointer("/thread/id")
+                    .and_then(Value::as_str)
+                    .or(thread_id);
+                let turn_id = result.pointer("/turn/id").and_then(Value::as_str);
+                for notification in notifications {
+                    if notification_matches_scope(&notification, thread_id, turn_id) {
+                        self.citations.write_value(stdout, &notification)?;
+                    }
+                }
+                return Ok(result);
             }
-            if notification_method(&value).is_some() {
-                write_value(stdout, &value)?;
+            if notification_method(&value).is_some() && !is_dropped_notification(&value) {
+                notifications.push(value);
             }
         }
     }
@@ -684,6 +726,7 @@ impl CodexJsonRpcChild {
         stdout: &mut W,
         request_id: &mut i64,
         model: &str,
+        thread_id: &str,
         traceparent: Option<&str>,
     ) -> Result<bool> {
         let mut cursor = None;
@@ -700,7 +743,7 @@ impl CodexJsonRpcChild {
                 }),
                 traceparent,
             )?;
-            let result = self.read_response_or_forward(id, stdout)?;
+            let result = self.read_response_or_forward(id, stdout, Some(thread_id))?;
             let response: ModelListResponse = serde_json::from_value(result)?;
             if response
                 .data
@@ -778,7 +821,9 @@ impl CodexJsonRpcChild {
                 }
                 continue;
             }
-            if notification_method(&value).is_none() {
+            if notification_method(&value).is_none()
+                || !notification_matches_scope(&value, Some(thread_id), Some(turn_id))
+            {
                 continue;
             }
             let terminal = is_terminal_notification(&value, thread_id, turn_id);
@@ -792,13 +837,13 @@ impl CodexJsonRpcChild {
                 GuardStep::Forward(values) => {
                     for value in &values {
                         telemetry.observe_wire_value(value);
-                        write_value(stdout, value)?;
+                        self.citations.write_value(stdout, value)?;
                     }
                 }
                 GuardStep::ForwardThenDone(values) => {
                     for value in &values {
                         telemetry.observe_wire_value(value);
-                        write_value(stdout, value)?;
+                        self.citations.write_value(stdout, value)?;
                     }
                     return Ok(TurnTermination::Done);
                 }
@@ -1071,6 +1116,11 @@ fn streams_turn_output(method: &str) -> bool {
     method.starts_with("item/") || method == "thread/tokenUsage/updated"
 }
 
+/// Notifications known to be unused by harness consumers.
+fn is_dropped_notification(value: &Value) -> bool {
+    notification_method(value) == Some("account/rateLimits/updated")
+}
+
 fn is_server_request(value: &Value) -> bool {
     value.get("id").is_some() && value.get("method").is_some()
 }
@@ -1148,6 +1198,26 @@ fn codex_supports_stdio_listen(bin: &str) -> bool {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     stdout.contains("--listen") || stderr.contains("--listen")
+}
+
+/// Only the requested thread and turn may reach the session stream. Codex
+/// 0.160.1 also emits child-agent notifications on the same app-server pipe;
+/// forwarding their answers or completion would close the parent execution.
+fn notification_matches_scope(
+    value: &Value,
+    thread_id: Option<&str>,
+    turn_id: Option<&str>,
+) -> bool {
+    let notification_thread = value
+        .pointer("/params/threadId")
+        .or_else(|| value.pointer("/params/thread/id"))
+        .and_then(Value::as_str);
+    let notification_turn = value
+        .pointer("/params/turnId")
+        .or_else(|| value.pointer("/params/turn/id"))
+        .and_then(Value::as_str);
+    notification_thread.is_none_or(|id| Some(id) == thread_id)
+        && notification_turn.is_none_or(|id| Some(id) == turn_id)
 }
 
 #[cfg(test)]
@@ -1236,6 +1306,13 @@ mod tests {
 
     fn agent_delta() -> Value {
         json!({ "method": "item/agentMessage/delta", "params": { "delta": "hi" } })
+    }
+
+    fn rate_limits_updated() -> Value {
+        json!({
+            "method": "account/rateLimits/updated",
+            "params": { "rateLimits": { "primary": null, "secondary": null } }
+        })
     }
 
     /// Runs a `(notification, is_terminal)` sequence through a `TurnGuard` and
@@ -1334,6 +1411,16 @@ mod tests {
             "params": { "status": { "type": "running" } }
         })));
         assert!(!is_system_error_status(&turn_started()));
+    }
+
+    #[test]
+    fn drops_only_the_rate_limits_notification() {
+        assert!(is_dropped_notification(&rate_limits_updated()));
+        assert!(!is_dropped_notification(&turn_started()));
+        assert!(!is_dropped_notification(&json!({
+            "method": "some/future/codexMethod",
+            "params": {}
+        })));
     }
 
     #[test]
@@ -1436,5 +1523,43 @@ mod tests {
         });
         assert!(!is_terminal_notification(&retryable, "thread-1", "turn-1"));
         assert!(is_terminal_notification(&exhausted, "thread-1", "turn-1"));
+    }
+
+    #[test]
+    fn notification_scope_preserves_parent_and_global_events() {
+        for params in [
+            json!({}),
+            json!({"threadId": "parent"}),
+            json!({"thread": {"id": "parent"}}),
+            json!({"threadId": "parent", "turnId": "active"}),
+            json!({"threadId": "parent", "turn": {"id": "active"}}),
+        ] {
+            assert!(notification_matches_scope(
+                &json!({"params": params}),
+                Some("parent"),
+                Some("active"),
+            ));
+        }
+    }
+
+    #[test]
+    fn notification_scope_rejects_children_and_stale_turns() {
+        for params in [
+            json!({"threadId": "child", "turnId": "active"}),
+            json!({"thread": {"id": "child"}}),
+            json!({"threadId": "parent", "turnId": "previous"}),
+            json!({"threadId": "parent", "turn": {"id": "previous"}}),
+        ] {
+            assert!(!notification_matches_scope(
+                &json!({"params": params}),
+                Some("parent"),
+                Some("active"),
+            ));
+        }
+        assert!(!notification_matches_scope(
+            &json!({"params": {"threadId": "child"}}),
+            None,
+            None,
+        ));
     }
 }

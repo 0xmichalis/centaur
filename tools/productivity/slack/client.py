@@ -22,7 +22,7 @@ import structlog
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
-from centaur_sdk.tool_sdk import secret
+from centaur_sdk.tool_sdk import COMPANY_CONTEXT_DSN_ENV, company_context_database_url, secret
 
 # structlog so these lines render as JSON through the tool-server's
 # configure_structlog() pipeline, like the rest of the service's logs.
@@ -78,26 +78,11 @@ class IndexedSlackClient:
 
     _DEFAULT_LIMIT = 20
     _MAX_LIMIT = 50
-    _DSN_ENV = "CENTAUR_POSTGRES_DSN"
-    _DATABASE_ENV = "COMPANY_CONTEXT_POSTGRES_DATABASE"
-    _DEFAULT_DATABASE = "centaur"
 
     def __init__(self, database_url: str | None = None):
-        value = database_url
-        if value is None:
-            value = os.getenv(self._DSN_ENV)  # noqa: TID251
-        if value is None:
-            value = secret(self._DSN_ENV, default="")
-        value = value.strip()
-        if not value or value == self._DSN_ENV:
-            raise RuntimeError(f"{self._DSN_ENV} is not configured")
-
-        database = os.getenv(self._DATABASE_ENV, self._DEFAULT_DATABASE).strip()  # noqa: TID251
-        parsed = urllib.parse.urlparse(value)
-        if parsed.scheme and parsed.netloc and parsed.path in ("", "/"):
-            value = urllib.parse.urlunparse(
-                parsed._replace(path=f"/{database or self._DEFAULT_DATABASE}")
-            )
+        value = company_context_database_url(database_url)
+        if not value:
+            raise RuntimeError(f"{COMPANY_CONTEXT_DSN_ENV} is not configured")
         self.database_url = value
 
     async def _search_messages(
@@ -826,15 +811,16 @@ class SlackClient:
         except Exception:
             pass
 
-    def _get_user_cache(self) -> dict[str, str]:
+    def _get_user_cache(self, *, direct: bool = False) -> dict[str, str]:
         """Get user ID -> name mapping, using cache when possible."""
         cached = self._load_user_cache()
         if cached:
             return cached
 
         user_cache: dict[str, str] = {}
+        client = self._search_client if direct else self._client
         try:
-            users_response = self._retry_on_ratelimit(self._client.users_list, limit=1000)
+            users_response = self._retry_on_ratelimit(client.users_list, limit=1000)
             for user in users_response.get("members", []):
                 user_cache[user.get("id", "")] = user.get("name", "")
             self._save_user_cache(user_cache)
@@ -842,7 +828,12 @@ class SlackClient:
             pass
         return user_cache
 
-    def list_bot_channels(self, limit: int = 500, force_refresh: bool = False) -> list[dict]:
+    def list_bot_channels(
+        self,
+        limit: int = 500,
+        force_refresh: bool = False,
+        query: str | None = None,
+    ) -> list[dict]:
         """List channels (public AND private) the bot is a member of.
 
         Bot membership is the relevant scope here, not just public visibility
@@ -863,12 +854,16 @@ class SlackClient:
         Args:
             limit: Maximum channels to return
             force_refresh: Ignore cache and fetch fresh data
+            query: Optional case-insensitive channel-name filter
 
         Returns:
             List of channel dicts with id, name, is_private
         """
-        # Check cache first
-        if not force_refresh:
+        normalized_query = query.strip().lower() if query else None
+
+        # A cached result may have been capped by an earlier unfiltered call, so
+        # a filtered lookup must paginate Slack until it finds enough matches.
+        if not force_refresh and not normalized_query:
             cached = self._load_channel_cache()
             if cached:
                 channels, _ = cached
@@ -882,7 +877,7 @@ class SlackClient:
                 response = self._retry_on_ratelimit(
                     self._client.users_conversations,
                     types="public_channel,private_channel",
-                    limit=min(limit - len(channels), 200),
+                    limit=min(limit - len(channels), 200) if not normalized_query else 200,
                     cursor=cursor,
                     exclude_archived=True,
                 )
@@ -897,14 +892,17 @@ class SlackClient:
             # to, so membership is implied — no client-side is_member filter
             # (and no whole-workspace pagination) needed.
             for channel in response.get("channels", []):
+                name = channel.get("name", "")
+                if normalized_query and normalized_query not in name.lower():
+                    continue
                 channels.append(
                     {
                         "id": channel.get("id", ""),
-                        "name": channel.get("name", ""),
+                        "name": name,
                         "purpose": channel.get("purpose", {}).get("value", ""),
                         "topic": channel.get("topic", {}).get("value", ""),
                         "member_count": channel.get("num_members", 0),
-                        "is_private": channel.get("is_private", False),
+                        "is_private": channel.get("is_private", True),
                     }
                 )
 
@@ -912,8 +910,9 @@ class SlackClient:
             if not cursor or len(channels) >= limit:
                 break
 
-        result = sorted(channels, key=lambda x: x["name"])
-        self._save_channel_cache(result)
+        result = sorted(channels, key=lambda x: x["name"])[:limit]
+        if not normalized_query:
+            self._save_channel_cache(result)
         return result
 
     def search_messages_direct(
@@ -1319,7 +1318,7 @@ class SlackClient:
             "sync_state": next_state,
         }
 
-    def list_channels(self, limit: int = 200) -> list[dict]:
+    def list_channels(self, limit: int = 200, query: str | None = None) -> list[dict]:
         """List Slack channels visible to the bot (public and private).
 
         Bot-visible channels include any private channel the bot has been
@@ -1329,6 +1328,7 @@ class SlackClient:
         """
         channels = []
         cursor = None
+        normalized_query = query.strip().lower() if query else None
 
         while True:
             try:
@@ -1336,7 +1336,7 @@ class SlackClient:
                     self._client.conversations_list,
                     method_key="conversations.list",
                     types="public_channel,private_channel",
-                    limit=min(limit - len(channels), 200),
+                    limit=min(limit - len(channels), 200) if not normalized_query else 200,
                     cursor=cursor,
                     exclude_archived=True,
                 )
@@ -1350,18 +1350,27 @@ class SlackClient:
                 cached = self._load_channel_cache()
                 if cached:
                     cached_channels, _ = cached
+                    if normalized_query:
+                        cached_channels = [
+                            channel
+                            for channel in cached_channels
+                            if normalized_query in channel.get("name", "").lower()
+                        ]
                     return cached_channels[:limit]
                 raise
 
             for channel in response.get("channels", []):
+                name = channel.get("name", "")
+                if normalized_query and normalized_query not in name.lower():
+                    continue
                 channels.append(
                     {
                         "id": channel.get("id", ""),
-                        "name": channel.get("name", ""),
+                        "name": name,
                         "purpose": channel.get("purpose", {}).get("value", ""),
                         "topic": channel.get("topic", {}).get("value", ""),
                         "member_count": channel.get("num_members", 0),
-                        "is_private": channel.get("is_private", False),
+                        "is_private": channel.get("is_private", True),
                         "is_member": channel.get("is_member", False),
                     }
                 )
@@ -1370,7 +1379,7 @@ class SlackClient:
             if not cursor or len(channels) >= limit:
                 break
 
-        return sorted(channels, key=lambda x: x["name"])
+        return sorted(channels, key=lambda x: x["name"])[:limit]
 
     def list_channels_proxy(
         self,
@@ -1404,7 +1413,9 @@ class SlackClient:
                 "purpose": channel.get("purpose", ""),
                 "topic": channel.get("topic", ""),
                 "member_count": channel.get("member_count", 0),
-                "is_private": channel.get("is_private", False),
+                "is_private": channel.get("is_private", True),
+                "is_im": channel.get("is_im", False),
+                "is_mpim": channel.get("is_mpim", False),
                 "is_member": channel.get("is_member", False),
                 "can_upload": channel.get("can_upload", False),
                 "can_download": channel.get("can_download", False),
@@ -1620,12 +1631,12 @@ class SlackClient:
         """
         try:
             user_response = self._retry_on_ratelimit(
-                self._client.users_info,
+                self._search_client.users_info,
                 user=user_id,
                 method_key="users.info",
             )
             profile_response = self._retry_on_ratelimit(
-                self._client.users_profile_get,
+                self._search_client.users_profile_get,
                 user=user_id,
                 include_labels=True,
                 method_key="users.profile.get",
@@ -1634,7 +1645,9 @@ class SlackClient:
             self._raise_slack_api_error(
                 e,
                 slack_method="users.profile.get",
-                access_path="bot_token",
+                access_path="search_token"
+                if self._search_client is not self._client
+                else "bot_token",
             )
 
         user = user_response.get("user", {})
@@ -2140,10 +2153,17 @@ class SlackClient:
         except SlackApiError as e:
             raise RuntimeError(f"Slack API error: {e.response['error']}") from e
 
-    def get_message_files(self, channel_id: str, message_ts: str) -> list[dict]:
+    def get_message_files(
+        self,
+        channel_id: str,
+        message_ts: str,
+        *,
+        direct: bool = False,
+    ) -> list[dict]:
         """Get files attached to a specific message."""
+        client = self._search_client if direct else self._client
         try:
-            response = self._client.conversations_replies(
+            response = client.conversations_replies(
                 channel=channel_id,
                 ts=message_ts,
                 limit=1,
@@ -2153,7 +2173,9 @@ class SlackClient:
             self._raise_slack_api_error(
                 e,
                 slack_method="conversations.replies",
-                access_path="bot_token",
+                access_path="search_token"
+                if direct and self._search_client is not self._client
+                else "bot_token",
                 requested_channel=channel_id,
                 resolved_channel=channel_id,
             )
@@ -2179,6 +2201,28 @@ class SlackClient:
 
         return files
 
+    def get_file_info_direct(self, file_id: str) -> dict[str, Any]:
+        """Fetch file metadata with the direct user-token client."""
+        normalized_file_id = file_id.strip().upper()
+        if not self._FILE_ID_RE.fullmatch(normalized_file_id):
+            raise ValueError(f"Invalid Slack file ID: {file_id!r}")
+
+        try:
+            response = self._retry_on_ratelimit(
+                self._search_client.files_info,
+                file=normalized_file_id,
+                method_key="files.info",
+            )
+        except SlackApiError as e:
+            self._raise_slack_api_error(
+                e,
+                slack_method="files.info",
+                access_path="search_token"
+                if self._search_client is not self._client
+                else "bot_token",
+            )
+        return dict(response.get("file") or {})
+
     # Slack file downloads buffer the file in memory before writing it, so cap the
     # size regardless of Slack's own (much larger) per-file limit.
     _MAX_DOWNLOAD_BYTES = 10 * 1024 * 1024
@@ -2186,12 +2230,13 @@ class SlackClient:
     def _fetch_slack_file(self, url: str) -> tuple[str, str, bytes]:
         """Download a Slack file's bytes: returns ``(filename, mime_type, body)``.
 
-        ``url`` must be an ``https://files.slack.com/`` URL. The bot token is
-        sent only to that host, so it can never be aimed at a Slack API
-        endpoint (e.g. api.test) that would echo the credential back.
+        ``url`` must be an ``https://files.slack.com/`` URL. The direct user
+        token is preferred and sent only to that host, so it can never be aimed
+        at a Slack API endpoint (e.g. api.test) that would echo the credential back.
         """
-        if not self.token:
-            raise RuntimeError("SLACK_BOT_TOKEN not set")
+        token = getattr(self, "search_token", "") or self.token
+        if not token:
+            raise RuntimeError("No Slack direct-access token is configured")
 
         parsed = urlparse(url)
         if parsed.scheme != "https" or (parsed.hostname or "").lower() != "files.slack.com":
@@ -2199,7 +2244,7 @@ class SlackClient:
                 f"Slack file downloads only accept https://files.slack.com/ URLs; refusing {url!r}"
             )
 
-        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {self.token}"})
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
         with urllib.request.urlopen(req) as response:
             # Read one byte past the cap so an oversized file is rejected
             # without buffering an unbounded response.
@@ -2255,13 +2300,13 @@ class SlackClient:
     ) -> list[dict]:
         """Search files directly through Slack's `files.list` API."""
         requested_limit = max(1, int(max_results))
-        user_cache = self._get_user_cache()
+        user_cache = self._get_user_cache(direct=True)
         results: list[dict] = []
         page = 1
         while len(results) < requested_limit:
             try:
                 response = self._retry_on_ratelimit(
-                    self._client.files_list,
+                    self._search_client.files_list,
                     count=self._MAX_SLACK_FILES_LIST_PAGE_SIZE,
                     page=page,
                 )
@@ -2269,7 +2314,9 @@ class SlackClient:
                 self._raise_slack_api_error(
                     e,
                     slack_method="files.list",
-                    access_path="bot_token",
+                    access_path="search_token"
+                    if self._search_client is not self._client
+                    else "bot_token",
                 )
             results.extend(self._filter_file_search_results(response, query, user_cache))
             if not self._files_list_response_has_more(response):
@@ -2594,6 +2641,10 @@ def update_usergroup_users(*args, **kwargs):
 
 def get_message_files(*args, **kwargs):
     return _client().get_message_files(*args, **kwargs)
+
+
+def get_file_info_direct(*args, **kwargs):
+    return _client().get_file_info_direct(*args, **kwargs)
 
 
 def _fetch_slack_file(*args, **kwargs):

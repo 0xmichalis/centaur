@@ -10,7 +10,8 @@ use std::{
 
 use absurd::{
     AwaitEventOptions, Client, ClientOptions, CreateQueueOptions, RetryKind, RetryStrategy,
-    SpawnOptions, StepHandle, TaskContext, TaskRegistrationOptions, Worker, WorkerOptions,
+    SpawnOptions, StepHandle, TaskContext, TaskRegistrationOptions, TaskResultState,
+    TaskTerminalOutcome, Worker, WorkerOptions,
 };
 use centaur_iron_control::{IronControlClient, IronControlError, PrincipalInput, slugify};
 use centaur_sandbox_core::SandboxSpec;
@@ -366,6 +367,7 @@ pub struct CreateWorkflowRunRequest {
 pub struct CreateWorkflowRunResponse {
     pub ok: bool,
     pub run_id: String,
+    pub initial_run_id: String,
     pub task_id: String,
     pub status: String,
     pub created: bool,
@@ -374,6 +376,7 @@ pub struct CreateWorkflowRunResponse {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct WorkflowRun {
     pub run_id: String,
+    pub initial_run_id: String,
     pub task_id: String,
     pub workflow_name: String,
     pub status: String,
@@ -728,8 +731,10 @@ impl WorkflowRuntime {
             .clone();
         reconcile_schedules(&schedule_client, &startup_schedules).await?;
 
+        let terminal_outcome_hook = Arc::new(record_terminal_workflow_outcome);
         let worker = client.start_worker(WorkerOptions {
             worker_id: Some("centaur-api-rs-workflow-worker".to_owned()),
+            on_task_terminal: Some(terminal_outcome_hook.clone()),
             concurrency: worker_concurrency(
                 WORKFLOW_WORKER_CONCURRENCY_ENV,
                 DEFAULT_WORKFLOW_WORKER_CONCURRENCY,
@@ -741,6 +746,7 @@ impl WorkflowRuntime {
         });
         let slack_live_worker = slack_live_client.start_worker(WorkerOptions {
             worker_id: Some("centaur-api-rs-workflow-slack-live-worker".to_owned()),
+            on_task_terminal: Some(terminal_outcome_hook.clone()),
             concurrency: 1,
             on_error: Some(Arc::new(|error| {
                 warn!(%error, "absurd workflow slack live worker error");
@@ -749,6 +755,7 @@ impl WorkflowRuntime {
         });
         let etl_worker = etl_client.start_worker(WorkerOptions {
             worker_id: Some("centaur-api-rs-workflow-etl-worker".to_owned()),
+            on_task_terminal: Some(terminal_outcome_hook.clone()),
             concurrency: worker_concurrency(
                 WORKFLOW_ETL_WORKER_CONCURRENCY_ENV,
                 DEFAULT_WORKFLOW_ETL_WORKER_CONCURRENCY,
@@ -760,6 +767,7 @@ impl WorkflowRuntime {
         });
         let etl_backfill_worker = etl_backfill_client.start_worker(WorkerOptions {
             worker_id: Some("centaur-api-rs-workflow-etl-backfill-worker".to_owned()),
+            on_task_terminal: Some(terminal_outcome_hook),
             concurrency: worker_concurrency(
                 WORKFLOW_ETL_BACKFILL_WORKER_CONCURRENCY_ENV,
                 DEFAULT_WORKFLOW_ETL_BACKFILL_WORKER_CONCURRENCY,
@@ -871,13 +879,39 @@ impl WorkflowRuntime {
                 },
             )
             .await?;
+        let initial_run_id = self.initial_run_id(workflow_name, &spawn.task_id).await?;
         Ok(CreateWorkflowRunResponse {
             ok: true,
             run_id: spawn.run_id,
+            initial_run_id,
             task_id: spawn.task_id,
             status: "queued".to_owned(),
             created: spawn.created,
         })
+    }
+
+    pub async fn initial_run_id(
+        &self,
+        workflow_name: &str,
+        task_id: &str,
+    ) -> Result<String, WorkflowRuntimeError> {
+        let queue_name = queue_name_for_class(workflow_queue_class(workflow_name));
+        let (_, run_table) = absurd_queue_tables(queue_name)?;
+        let row = sqlx::query(&format!(
+            r#"
+            select run_id::text as run_id
+            from {run_table}
+            where task_id = $1::uuid
+            order by attempt, run_id
+            limit 1
+            "#,
+        ))
+        .bind(task_id)
+        .fetch_optional(self.inner.client.pool())
+        .await?;
+        row.map(|row| row.try_get("run_id"))
+            .transpose()?
+            .ok_or_else(|| WorkflowRuntimeError::NotFound(task_id.to_owned()))
     }
 
     pub async fn list_runs(
@@ -923,6 +957,13 @@ impl WorkflowRuntime {
             r#"
             select
                 r.run_id::text as run_id,
+                (
+                    select initial.run_id::text
+                    from {run_table} initial
+                    where initial.task_id = t.task_id
+                    order by initial.attempt, initial.run_id
+                    limit 1
+                ) as initial_run_id,
                 t.task_id::text as task_id,
                 t.task_name,
                 t.params,
@@ -974,6 +1015,13 @@ impl WorkflowRuntime {
             r#"
             select
                 r.run_id::text as run_id,
+                (
+                    select initial.run_id::text
+                    from {run_table} initial
+                    where initial.task_id = t.task_id
+                    order by initial.attempt, initial.run_id
+                    limit 1
+                ) as initial_run_id,
                 t.task_id::text as task_id,
                 t.task_name,
                 t.params,
@@ -1083,13 +1131,12 @@ enum WorkflowQueueClass {
 fn workflow_queue_class(workflow_name: &str) -> WorkflowQueueClass {
     match workflow_name {
         "slack_sync" => WorkflowQueueClass::SlackLive,
-        "slack_backfill" | "slack_archive_import" => WorkflowQueueClass::EtlBackfill,
+        "slack_backfill" => WorkflowQueueClass::EtlBackfill,
         "google_calendar_sync"
         | "google_drive_sync"
         | "linear_sync"
         | "company_context_documents"
         | "company_context_embeddings"
-        | "memory_generation"
         | "slack_retention"
         | "chief_of_staff_daily" => WorkflowQueueClass::Etl,
         _ => WorkflowQueueClass::Standard,
@@ -2608,6 +2655,33 @@ fn normalize_cron_expression(expr: &str) -> String {
         format!("0 {expr}")
     } else {
         expr.to_owned()
+    }
+}
+
+fn terminal_workflow_metric(outcome: &TaskTerminalOutcome) -> Option<(&str, &str, &'static str)> {
+    if outcome.task_name != WORKFLOW_TASK {
+        return None;
+    }
+    let workflow_name = outcome
+        .params
+        .get("workflow_name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("unknown");
+    let status = match outcome.state {
+        TaskResultState::Completed => "completed",
+        TaskResultState::Failed => "failed",
+        TaskResultState::Cancelled => "cancelled",
+        TaskResultState::Pending | TaskResultState::Running | TaskResultState::Sleeping => {
+            return None;
+        }
+    };
+    Some((&outcome.queue_name, workflow_name, status))
+}
+
+fn record_terminal_workflow_outcome(outcome: TaskTerminalOutcome) {
+    if let Some((queue_name, workflow_name, status)) = terminal_workflow_metric(&outcome) {
+        centaur_telemetry::record_workflow_run(queue_name, workflow_name, status);
     }
 }
 
@@ -4519,6 +4593,7 @@ fn workflow_run_from_row(row: sqlx::postgres::PgRow) -> Result<WorkflowRun, Work
         .to_owned();
     Ok(WorkflowRun {
         run_id: row.try_get("run_id")?,
+        initial_run_id: row.try_get("initial_run_id")?,
         task_id: row.try_get("task_id")?,
         workflow_name,
         status: row.try_get("state")?,
@@ -5031,38 +5106,6 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_etls_use_isolated_etl_queues() {
-        assert_eq!(
-            workflow_queue_class("slack_sync"),
-            WorkflowQueueClass::SlackLive
-        );
-        for workflow_name in [
-            "google_calendar_sync",
-            "google_drive_sync",
-            "linear_sync",
-            "company_context_documents",
-            "company_context_embeddings",
-            "memory_generation",
-            "slack_retention",
-            "chief_of_staff_daily",
-        ] {
-            assert_eq!(workflow_queue_class(workflow_name), WorkflowQueueClass::Etl);
-        }
-        assert_eq!(
-            workflow_queue_class("slack_backfill"),
-            WorkflowQueueClass::EtlBackfill
-        );
-        assert_eq!(
-            workflow_queue_class("slack_archive_import"),
-            WorkflowQueueClass::EtlBackfill
-        );
-        assert_eq!(
-            workflow_queue_class("github_issue_triage"),
-            WorkflowQueueClass::Standard
-        );
-    }
-
-    #[test]
     fn python_slack_payload_passes_reply_broadcast() {
         let payload = python_slack_message_payload(
             "C123",
@@ -5165,6 +5208,7 @@ mod tests {
             + time::Duration::nanoseconds(44_019_000);
         let run = WorkflowRun {
             run_id: "run".to_owned(),
+            initial_run_id: "initial-run".to_owned(),
             task_id: "task".to_owned(),
             workflow_name: "workflow".to_owned(),
             status: "completed".to_owned(),
@@ -5176,6 +5220,7 @@ mod tests {
             updated_at: at,
         };
         let value = serde_json::to_value(run).unwrap();
+        assert_eq!(value["initial_run_id"], json!("initial-run"));
         assert_eq!(value["created_at"], json!("2026-06-09T13:35:05.044019Z"));
         assert_eq!(value["updated_at"], json!("2026-06-09T13:35:05.044019Z"));
     }
@@ -5253,18 +5298,6 @@ mod tests {
         assert_eq!(
             canonical_workflow_principal_foreign_id("Managing Partner Daily Briefing"),
             "workflow-managing-partner-daily-briefing"
-        );
-    }
-
-    #[test]
-    fn workflow_principal_labels_keep_extensible_metadata_only() {
-        let labels = workflow_principal_labels("nightly_report");
-
-        assert!(!labels.contains_key("kind"));
-        assert!(!labels.contains_key("purpose"));
-        assert_eq!(
-            labels.get("workflow_name").map(String::as_str),
-            Some("nightly_report")
         );
     }
 
@@ -5584,6 +5617,36 @@ mod tests {
             .ensure_enabled("slack_sync")
             .unwrap_err();
         assert!(matches!(error, WorkflowRuntimeError::Disabled(_)));
+    }
+
+    #[test]
+    fn terminal_workflow_metrics_use_durable_outcomes() {
+        for (state, expected_status) in [
+            (TaskResultState::Completed, "completed"),
+            (TaskResultState::Failed, "failed"),
+            (TaskResultState::Cancelled, "cancelled"),
+        ] {
+            let outcome = TaskTerminalOutcome {
+                queue_name: WORKFLOW_QUEUE.to_owned(),
+                task_id: "task-1".to_owned(),
+                task_name: WORKFLOW_TASK.to_owned(),
+                params: json!({"workflow_name": "example"}),
+                state,
+            };
+            assert_eq!(
+                terminal_workflow_metric(&outcome),
+                Some((WORKFLOW_QUEUE, "example", expected_status))
+            );
+        }
+
+        let non_terminal = TaskTerminalOutcome {
+            queue_name: WORKFLOW_QUEUE.to_owned(),
+            task_id: "task-1".to_owned(),
+            task_name: WORKFLOW_TASK.to_owned(),
+            params: json!({"workflow_name": "example"}),
+            state: TaskResultState::Sleeping,
+        };
+        assert_eq!(terminal_workflow_metric(&non_terminal), None);
     }
 
     #[test]

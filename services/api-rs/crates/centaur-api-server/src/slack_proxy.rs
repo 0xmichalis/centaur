@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::OnceLock,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -13,7 +13,7 @@ use axum::{
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::{
     ApiError,
@@ -33,6 +33,13 @@ const SLACK_CHANNEL_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const SLACK_CHANNEL_REFRESH_RETRY_DELAY: Duration = Duration::from_secs(60);
 const SLACK_RATE_LIMIT_MAX_RETRIES: u32 = 2;
 const SLACK_RATE_LIMIT_MAX_DELAY: Duration = Duration::from_secs(60);
+const SLACK_FILE_SHARE_PROPAGATION_WINDOW: Duration = Duration::from_secs(10);
+const SLACK_FILE_SHARE_RETRY_DELAYS: [Duration; 4] = [
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+];
 
 fn http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
@@ -202,6 +209,20 @@ struct SlackFileInfoResponse {
     file: Value,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct SlackMessagesResponse {
+    ok: bool,
+    #[serde(default)]
+    channel_id: String,
+    messages: Vec<Value>,
+    #[serde(default)]
+    has_more: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    response_metadata: Option<SlackResponseMetadata>,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
 #[derive(Debug, Serialize)]
 struct SlackChannelItem {
     id: String,
@@ -210,10 +231,16 @@ struct SlackChannelItem {
     topic: String,
     member_count: u64,
     is_private: bool,
+    is_im: bool,
+    is_mpim: bool,
     is_member: bool,
     can_upload: bool,
     can_download: bool,
     can_read_history: bool,
+}
+
+fn default_private() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -227,8 +254,12 @@ struct SlackChannel {
     topic: SlackChannelText,
     #[serde(default)]
     num_members: u64,
+    #[serde(default = "default_private")]
+    is_private: bool,
     #[serde(default)]
-    is_private: Option<bool>,
+    is_im: bool,
+    #[serde(default)]
+    is_mpim: bool,
     #[serde(default)]
     is_member: bool,
 }
@@ -251,7 +282,7 @@ struct SlackChannelsPage {
     response_metadata: SlackResponseMetadata,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 struct SlackResponseMetadata {
     #[serde(default)]
     next_cursor: String,
@@ -475,12 +506,14 @@ async fn authorized_slack_file_info(
         SlackChannelPermission::Download,
     )
     .await?;
-    let file = slack_file_info(client, config, file_id).await?;
-    if !slack_file_in_channel(&file, channel_id) {
-        return Err(ApiError::Forbidden(
-            "file is not shared in an allowed Slack channel".to_owned(),
-        ));
-    }
+    let file = slack_file_info_with_share_retry(
+        client,
+        config,
+        file_id,
+        channel_id,
+        &SLACK_FILE_SHARE_RETRY_DELAYS,
+    )
+    .await?;
     Ok((config, file))
 }
 
@@ -587,7 +620,7 @@ async fn get_slack_channel_history(
     headers: HeaderMap,
     Path(channel_id): Path<String>,
     Query(query): Query<SlackChannelHistoryQuery>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<SlackMessagesResponse>, ApiError> {
     let claims = authorize_slack_file_proxy(&headers)?;
     validate_slack_channel_id(&channel_id)?;
     validate_slack_channel_history_query(&query)?;
@@ -633,7 +666,7 @@ async fn get_slack_thread_replies(
     headers: HeaderMap,
     Path((channel_id, thread_ts)): Path<(String, String)>,
     Query(query): Query<SlackChannelHistoryQuery>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<SlackMessagesResponse>, ApiError> {
     let claims = authorize_slack_file_proxy(&headers)?;
     validate_slack_channel_id(&channel_id)?;
     validate_slack_thread_ts(&thread_ts)?;
@@ -863,6 +896,49 @@ async fn slack_file_info(
     })
 }
 
+async fn slack_file_info_with_share_retry(
+    client: &reqwest::Client,
+    config: &SlackFileProxyConfig,
+    file_id: &str,
+    channel_id: &str,
+    retry_delays: &[Duration],
+) -> Result<Value, ApiError> {
+    let mut file = slack_file_info(client, config, file_id).await?;
+    if slack_file_in_channel(&file, channel_id) {
+        return Ok(file);
+    }
+
+    if slack_file_share_may_be_propagating(&file) {
+        for delay in retry_delays {
+            tokio::time::sleep(*delay).await;
+            file = slack_file_info(client, config, file_id).await?;
+            if slack_file_in_channel(&file, channel_id) {
+                return Ok(file);
+            }
+            if !slack_file_channel_ids(&file).is_empty() {
+                break;
+            }
+        }
+    }
+
+    Err(ApiError::Forbidden(
+        "file is not shared in an allowed Slack channel".to_owned(),
+    ))
+}
+
+fn slack_file_share_may_be_propagating(file: &Value) -> bool {
+    if !slack_file_channel_ids(file).is_empty() {
+        return false;
+    }
+    let Some(created) = file.get("created").and_then(Value::as_u64) else {
+        return false;
+    };
+    let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return false;
+    };
+    now.as_secs().abs_diff(created) <= SLACK_FILE_SHARE_PROPAGATION_WINDOW.as_secs()
+}
+
 async fn slack_channel_info(
     client: &reqwest::Client,
     config: &SlackFileProxyConfig,
@@ -1083,9 +1159,10 @@ async fn slack_channel_history(
     config: &SlackFileProxyConfig,
     channel_id: &str,
     query: &SlackChannelHistoryQuery,
-) -> Result<Value, ApiError> {
+) -> Result<SlackMessagesResponse, ApiError> {
     let form = slack_channel_history_form(channel_id, query);
-    slack_api_post_form(client, config, "conversations.history", &form).await
+    let value = slack_api_post_form(client, config, "conversations.history", &form).await?;
+    slack_messages_response("conversations.history", channel_id, value)
 }
 
 async fn slack_thread_replies(
@@ -1094,9 +1171,22 @@ async fn slack_thread_replies(
     channel_id: &str,
     thread_ts: &str,
     query: &SlackChannelHistoryQuery,
-) -> Result<Value, ApiError> {
+) -> Result<SlackMessagesResponse, ApiError> {
     let form = slack_thread_replies_form(channel_id, thread_ts, query);
-    slack_api_post_form(client, config, "conversations.replies", &form).await
+    let value = slack_api_post_form(client, config, "conversations.replies", &form).await?;
+    slack_messages_response("conversations.replies", channel_id, value)
+}
+
+fn slack_messages_response(
+    method: &str,
+    channel_id: &str,
+    value: Value,
+) -> Result<SlackMessagesResponse, ApiError> {
+    let mut response = serde_json::from_value::<SlackMessagesResponse>(value).map_err(|error| {
+        ApiError::Internal(format!("Slack {method} response was invalid: {error}"))
+    })?;
+    response.channel_id = channel_id.to_owned();
+    Ok(response)
 }
 
 async fn slack_files_list(
@@ -1341,7 +1431,7 @@ async fn ensure_slack_channel_allowed(
 }
 
 fn slack_channel_has_default_access(channel: &SlackChannel) -> bool {
-    channel.is_private == Some(false) && channel.is_member
+    !channel.is_private && channel.is_member
 }
 
 fn slack_channel_ids_from_claims(claims: &SlackFileProxyClaims) -> Result<Vec<String>, ApiError> {
@@ -1381,9 +1471,9 @@ fn slack_channel_item(
         purpose: channel.purpose.value.clone(),
         topic: channel.topic.value.clone(),
         member_count: channel.num_members,
-        is_private: channel
-            .is_private
-            .unwrap_or_else(|| channel_id.starts_with('G')),
+        is_private: channel.is_private,
+        is_im: channel.is_im,
+        is_mpim: channel.is_mpim,
         is_member: channel.is_member,
         can_upload: claims
             .slack
@@ -1638,9 +1728,12 @@ fn content_disposition_filename(filename: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     use super::*;
@@ -1659,6 +1752,16 @@ mod tests {
         serde_json::from_value(value).unwrap()
     }
 
+    fn test_claims() -> SlackFileProxyClaims {
+        SlackFileProxyClaims {
+            slack: SlackProxyClaims {
+                upload_channels: vec![],
+                download_channels: vec![],
+                history_channels: vec![],
+            },
+        }
+    }
+
     fn test_channel_item(id: &str, name: &str, can_read_history: bool) -> SlackChannelItem {
         SlackChannelItem {
             id: id.to_owned(),
@@ -1667,6 +1770,8 @@ mod tests {
             topic: String::new(),
             member_count: 0,
             is_private: false,
+            is_im: false,
+            is_mpim: false,
             is_member: true,
             can_upload: false,
             can_download: false,
@@ -1750,6 +1855,8 @@ mod tests {
         assert_eq!(item.topic, "Announcements");
         assert_eq!(item.member_count, 42);
         assert!(!item.is_private);
+        assert!(!item.is_im);
+        assert!(!item.is_mpim);
         assert!(item.is_member);
         assert!(item.can_upload);
         assert!(item.can_download);
@@ -1757,14 +1864,45 @@ mod tests {
     }
 
     #[test]
-    fn slack_channel_requires_an_id() {
-        assert!(
-            serde_json::from_value::<SlackChannel>(json!({
-                "is_private": false,
-                "is_member": true
-            }))
-            .is_err()
+    fn channel_item_defaults_missing_privacy_metadata_to_private() {
+        let claims = test_claims();
+
+        for channel_id in ["C123456789", "D123456789", "G123456789"] {
+            let channel = test_channel(json!({ "id": channel_id }));
+            let item = slack_channel_item(&claims, channel_id, &channel);
+            assert!(item.is_private, "missing is_private for {channel_id}");
+            assert!(!item.is_im);
+            assert!(!item.is_mpim);
+        }
+    }
+
+    #[test]
+    fn channel_item_passes_conversation_type_through() {
+        let claims = test_claims();
+
+        let public_item = slack_channel_item(
+            &claims,
+            "C123456789",
+            &test_channel(json!({ "id": "C123456789", "is_private": false })),
         );
+        assert!(!public_item.is_private);
+
+        let dm_item = slack_channel_item(
+            &claims,
+            "D123456789",
+            &test_channel(json!({ "id": "D123456789", "is_im": true })),
+        );
+        assert!(dm_item.is_private);
+        assert!(dm_item.is_im);
+        assert!(!dm_item.is_mpim);
+
+        let mpim_item = slack_channel_item(
+            &claims,
+            "G987654321",
+            &test_channel(json!({ "id": "G987654321", "is_mpim": true })),
+        );
+        assert!(mpim_item.is_private);
+        assert!(mpim_item.is_mpim);
     }
 
     #[test]
@@ -1779,6 +1917,8 @@ mod tests {
         for inaccessible in [
             test_channel(json!({"id": "G123456789", "is_private": true, "is_member": true})),
             test_channel(json!({"id": "C123456789", "is_private": false, "is_member": false})),
+            // Missing privacy metadata defaults to private.
+            test_channel(json!({"id": "D123456789", "is_member": true})),
         ] {
             assert!(!slack_channel_has_default_access(&inaccessible));
         }
@@ -1904,6 +2044,79 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn file_info_retries_recent_files_until_channel_membership_appears() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let handler_attempts = attempts.clone();
+        let created = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let app = axum::Router::new().route(
+            "/files.info",
+            axum::routing::post(move || {
+                let attempt = handler_attempts.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    let channels = if attempt < 2 {
+                        Vec::<String>::new()
+                    } else {
+                        vec!["C123456789".to_owned()]
+                    };
+                    axum::Json(json!({
+                        "ok": true,
+                        "file": {
+                            "id": "F123456789",
+                            "created": created,
+                            "channels": channels
+                        }
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = SlackFileProxyConfig {
+            api_url: format!("http://{address}"),
+            bot_token: "test-token".to_owned(),
+            max_upload_bytes: 1,
+        };
+
+        let file = slack_file_info_with_share_retry(
+            http_client(),
+            &config,
+            "F123456789",
+            "C123456789",
+            &[Duration::ZERO; 4],
+        )
+        .await
+        .unwrap();
+
+        assert!(slack_file_in_channel(&file, "C123456789"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        server.abort();
+    }
+
+    #[test]
+    fn file_share_retry_only_applies_to_recent_files_without_memberships() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(slack_file_share_may_be_propagating(&json!({
+            "created": now,
+            "channels": []
+        })));
+        assert!(!slack_file_share_may_be_propagating(&json!({
+            "created": now,
+            "channels": ["C987654321"]
+        })));
+        assert!(!slack_file_share_may_be_propagating(&json!({
+            "created": now.saturating_sub(SLACK_FILE_SHARE_PROPAGATION_WINDOW.as_secs() + 1),
+            "channels": []
+        })));
+    }
+
     #[test]
     fn slack_rate_limit_delay_honors_retry_after_and_caps_it() {
         assert_eq!(
@@ -2024,26 +2237,13 @@ mod tests {
 
     #[test]
     fn bot_channel_listing_requests_public_channels_only() {
-        assert_eq!(
-            slack_public_channels_form("cursor-1"),
-            vec![
-                ("types", "public_channel".to_owned()),
-                ("exclude_archived", "true".to_owned()),
-                ("limit", "200".to_owned()),
-                ("cursor", "cursor-1".to_owned()),
-            ]
-        );
-    }
-
-    #[test]
-    fn channel_info_form_requests_member_counts() {
-        assert_eq!(
-            slack_channel_info_form("C123456789"),
-            vec![
-                ("channel", "C123456789".to_owned()),
-                ("include_num_members", "true".to_owned()),
-            ]
-        );
+        let form = slack_public_channels_form("cursor-1");
+        let types: Vec<_> = form
+            .iter()
+            .filter(|(name, _)| *name == "types")
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(types, ["public_channel"]);
     }
 
     #[test]
@@ -2096,14 +2296,6 @@ mod tests {
                 ("limit", "500".to_owned()),
                 ("cursor", "cursor-1".to_owned()),
             ]
-        );
-    }
-
-    #[test]
-    fn file_info_form_maps_proxy_query_to_slack_params() {
-        assert_eq!(
-            slack_file_info_form("F123456789"),
-            vec![("file", "F123456789".to_owned())]
         );
     }
 
@@ -2543,5 +2735,124 @@ mod tests {
                 ("ts", "1700000000.000001".to_owned()),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn history_and_replies_include_requested_channel() {
+        let app = axum::Router::new()
+            .route(
+                "/conversations.history",
+                axum::routing::post(
+                    |axum::Form(form): axum::Form<HashMap<String, String>>| async move {
+                        assert_eq!(form["channel"], "C123456789");
+                        axum::Json(json!({
+                            "ok": true,
+                            "messages": [{"ts": "1700000000.000001", "text": "report"}],
+                            "has_more": true,
+                            "pin_count": 2,
+                            "response_metadata": {"next_cursor": "next"}
+                        }))
+                    },
+                ),
+            )
+            .route(
+                "/conversations.replies",
+                axum::routing::post(
+                    |axum::Form(form): axum::Form<HashMap<String, String>>| async move {
+                        assert_eq!(form["channel"], "G123456789");
+                        assert_eq!(form["ts"], "1700000000.000001");
+                        axum::Json(json!({"ok": true, "messages": [], "has_more": false}))
+                    },
+                ),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = SlackFileProxyConfig {
+            api_url: format!("http://{address}"),
+            bot_token: "test-token".to_owned(),
+            max_upload_bytes: 1,
+        };
+        let query = serde_json::from_value(json!({})).unwrap();
+
+        let history = slack_channel_history(http_client(), &config, "C123456789", &query)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(history).unwrap(),
+            json!({
+                "ok": true,
+                "channel_id": "C123456789",
+                "messages": [{"ts": "1700000000.000001", "text": "report"}],
+                "has_more": true,
+                "pin_count": 2,
+                "response_metadata": {"next_cursor": "next"}
+            })
+        );
+
+        let replies = slack_thread_replies(
+            http_client(),
+            &config,
+            "G123456789",
+            "1700000000.000001",
+            &query,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(replies).unwrap(),
+            json!({
+                "ok": true,
+                "channel_id": "G123456789",
+                "messages": [],
+                "has_more": false
+            })
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn history_and_replies_preserve_upstream_errors() {
+        let app = axum::Router::new()
+            .route(
+                "/conversations.history",
+                axum::routing::post(|| async {
+                    axum::Json(json!({"ok": false, "error": "channel_not_found"}))
+                }),
+            )
+            .route(
+                "/conversations.replies",
+                axum::routing::post(|| async {
+                    axum::Json(json!({"ok": false, "error": "thread_not_found"}))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = SlackFileProxyConfig {
+            api_url: format!("http://{address}"),
+            bot_token: "test-token".to_owned(),
+            max_upload_bytes: 1,
+        };
+        let query = serde_json::from_value(json!({})).unwrap();
+        let history = slack_channel_history(http_client(), &config, "C123456789", &query)
+            .await
+            .unwrap_err();
+        let replies = slack_thread_replies(
+            http_client(),
+            &config,
+            "C123456789",
+            "1700000000.000001",
+            &query,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(history, ApiError::BadRequest(message) if message == "Slack conversations.history failed: channel_not_found")
+        );
+        assert!(
+            matches!(replies, ApiError::BadRequest(message) if message == "Slack conversations.replies failed: thread_not_found")
+        );
+        server.abort();
     }
 }

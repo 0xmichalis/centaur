@@ -88,11 +88,11 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 RUN useradd -m -s /bin/bash -u 1001 agent \
     && echo "agent ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/agent
 
-ARG CLAUDE_CODE_VERSION=2.1.245
-ARG CODEX_VERSION=0.153.2
+ARG CLAUDE_CODE_VERSION=2.1.281
+ARG CODEX_VERSION=0.160.1
+ARG PI_CODING_AGENT_VERSION=1.0.0
 # Hermes Agent (NousResearch) — pinned by commit SHA per the dependency policy.
 ARG HERMES_AGENT_REF=e5e2fb8b2dbe1cae85aa5ad6ce45aef376016e43
-ARG PI_CODING_AGENT_VERSION=0.67.2
 ARG NUSHELL_VERSION=0.112.2
 ARG KUBECTL_VERSION=v1.34.2
 ARG KACHE_VERSION=v0.7.0
@@ -150,13 +150,17 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
     npm install -g --prefer-online --force \
       "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
       "@openai/codex@${CODEX_VERSION}" \
-      "@mariozechner/pi-coding-agent@${PI_CODING_AGENT_VERSION}" \
+      "@earendil-works/pi-coding-agent@${PI_CODING_AGENT_VERSION}" \
       "pnpm@${PNPM_VERSION}" \
       agent-browser@0.26.0 \
     && find /usr/lib/node_modules -type f \( -name '*.map' -o -name '*.tsbuildinfo' \) -delete \
     && claude --version | grep -F "${CLAUDE_CODE_VERSION}" \
     && codex --version | grep -F "${CODEX_VERSION}" \
+    && pi --version | grep -Fx "${PI_CODING_AGENT_VERSION}" \
     && pnpm --version | grep -F "${PNPM_VERSION}"
+# Keep every pi run, the harness's and the agent's own, from phoning home.
+ENV PI_TELEMETRY=0 \
+    PI_SKIP_VERSION_CHECK=1
 
 # ── Hermes Agent (own venv; exposes `hermes` + the tui_gateway module) ───────
 # The hermes harness drives `python -m tui_gateway.entry` (see
@@ -201,7 +205,8 @@ ENV PATH="/home/agent/.cargo/bin:/home/agent/.local/bin:/home/agent/.foundry/bin
 ARG FOUNDRY_VERSION=v1.7.0
 ARG AMP_CLI_VERSION=0.0.1774529752-g94f44d
 ARG MANIM_VERSION=0.20.1
-ARG BUN_VERSION=bun-v1.3.13
+ARG BUN_VERSION=bun-v1.3.14
+ARG OMP_VERSION=18.8.6
 
 # ── Agent-scoped toolchains ─────────────────────────────────────────────────
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
@@ -221,15 +226,32 @@ RUN --mount=type=cache,target=/home/agent/.cargo/registry,uid=1001,gid=1001,shar
     && kache --version
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 RUN curl -fsSL https://bun.sh/install | bash -s "${BUN_VERSION}"
+# Optional and peer dependencies are OMP's local-model features (onnxruntime,
+# transformers, speech), off by default and about 600 MB. Omitting them also
+# omits pi-natives' platform addon, so that is installed explicitly. Bun still
+# downloads them into its cache, which is dropped; the install keeps its files.
+RUN set -eux; \
+    omp_platform="$(case "$(dpkg --print-architecture)" in \
+      amd64) echo linux-x64 ;; \
+      arm64) echo linux-arm64 ;; \
+      *) echo unsupported-architecture >&2; exit 1 ;; \
+    esac)"; \
+    bun install -g --omit=optional --omit=peer \
+      "@oh-my-pi/pi-coding-agent@${OMP_VERSION}" \
+      "@oh-my-pi/pi-natives-${omp_platform}@${OMP_VERSION}"; \
+    rm -rf "$HOME/.bun/install/cache"; \
+    omp --version | grep -Fx "omp/${OMP_VERSION}"
 RUN --mount=type=cache,target=/home/agent/.cache/uv,uid=1001,gid=1001,sharing=locked \
     uv tool install "manim==${MANIM_VERSION}" \
     && manim --version
 RUN curl -L https://foundry.paradigm.xyz | bash \
     && /home/agent/.foundry/bin/foundryup --install ${FOUNDRY_VERSION} \
     && for bin in forge cast anvil chisel; do \
-      rm -f "$HOME/.foundry/bin/$bin"; \
-      ln -s "$HOME/.foundry/versions/${FOUNDRY_VERSION}/$bin" "$HOME/.foundry/bin/$bin"; \
-    done
+      src="$(find "$HOME/.foundry/versions" -type f -name "$bin" | head -n1)"; \
+      [ -n "$src" ] || { echo "foundry: $bin not found under ~/.foundry/versions" >&2; exit 1; }; \
+      ln -sf "$src" "$HOME/.foundry/bin/$bin"; \
+    done \
+    && cast --version && forge --version && anvil --version
 RUN set -eux; \
     amp_platform="$(case "$(dpkg --print-architecture)" in \
       amd64) echo linux-x64 ;; \
@@ -264,7 +286,7 @@ RUN --mount=type=cache,target=/home/agent/.npm,uid=1001,gid=1001,sharing=locked 
     && test -s .agents/skills/agent-browser/SKILL.md
 # git-branch configures each writable clone with the publishing GitHub account.
 # A baked agent identity would reappear as a co-author when GitHub squash-merges its commits.
-RUN mkdir -p ~/.amp/bin ~/.config/amp ~/.codex ~/.pi/agent ~/github ~/workspace \
+RUN mkdir -p ~/.amp/bin ~/.config/amp ~/.codex ~/github ~/workspace \
     && git config --global init.defaultBranch main \
     && git config --global push.autoSetupRemote true \
     && git config --global core.hooksPath /opt/centaur/git-hooks \

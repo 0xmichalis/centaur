@@ -1,5 +1,6 @@
 import base64
 import tomllib
+import uuid
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -92,6 +93,18 @@ class _FakeRevisionsApi:
         return _CreateRequest(self.get_result)
 
 
+class _FakeDrivesApi:
+    def __init__(self, list_results: list[dict] | None = None):
+        self.list_results = list(list_results or [])
+        self.list_calls: list[dict] = []
+
+    def list(self, **kwargs):
+        self.list_calls.append(kwargs)
+        if not self.list_results:
+            raise AssertionError("Unexpected extra drives.list call")
+        return _CreateRequest(self.list_results.pop(0))
+
+
 class _FakeCommentsApi:
     def __init__(self, list_results: list[dict] | None = None):
         self.list_results = list(list_results or [])
@@ -110,6 +123,7 @@ class _FakeDriveService:
         revision_list_results: list[dict] | None = None,
         revision_get_result: dict | None = None,
         comment_list_results: list[dict] | None = None,
+        drive_list_results: list[dict] | None = None,
     ):
         self.files_api = _FakeFilesApi()
         self.revisions_api = _FakeRevisionsApi(
@@ -117,6 +131,7 @@ class _FakeDriveService:
             revision_get_result,
         )
         self.comments_api = _FakeCommentsApi(comment_list_results)
+        self.drives_api = _FakeDrivesApi(drive_list_results)
 
     def files(self):
         return self.files_api
@@ -126,6 +141,9 @@ class _FakeDriveService:
 
     def comments(self):
         return self.comments_api
+
+    def drives(self):
+        return self.drives_api
 
 
 class _FakeGmailMessagesApi:
@@ -325,10 +343,24 @@ def test_drive_list_searches_name_by_default(monkeypatch):
 
     list_call = fake_service.files_api.list_calls[0]
     assert list_call["q"] == "name contains 'report' and trashed = false"
+    assert list_call["corpora"] == "allDrives"
     assert list_call["includeItemsFromAllDrives"] is True
     assert list_call["supportsAllDrives"] is True
     assert result[0]["id"] == "file-123"
     assert result[0]["size"] == 1024
+
+
+def test_drive_list_rejects_incomplete_all_drives_search(monkeypatch):
+    fake_service = _FakeDriveService()
+    fake_service.files_api.list = Mock(
+        return_value=_CreateRequest({"files": [], "incompleteSearch": True})
+    )
+    monkeypatch.setattr(client, "get_drive_service", lambda: fake_service)
+
+    with pytest.raises(RuntimeError, match="could not search all drives"):
+        client.drive_list()
+
+    assert "incompleteSearch" in fake_service.files_api.list.call_args.kwargs["fields"]
 
 
 def test_drive_list_supports_full_text_contains_and_escapes_literals(monkeypatch):
@@ -349,6 +381,39 @@ def test_drive_list_supports_full_text_contains_and_escapes_literals(monkeypatch
         "mimeType = 'application/pdf' and "
         "trashed = false"
     )
+
+
+def test_drive_list_drives_paginates_and_stops_at_limit(monkeypatch):
+    fake_service = _FakeDriveService(
+        drive_list_results=[
+            {
+                "drives": [
+                    {"id": "drive-1", "name": "Engineering"},
+                    {"id": "drive-2", "name": "Bizz&Plans"},
+                ],
+                "nextPageToken": "page-2",
+            },
+            {
+                "drives": [{"id": "drive-3", "name": "meeting-artifacts"}],
+                "nextPageToken": "page-3",
+            },
+        ]
+    )
+    monkeypatch.setattr(client, "get_drive_service", lambda: fake_service)
+
+    result = client.drive_list_drives(max_results=3)
+
+    assert result == [
+        {"id": "drive-1", "name": "Engineering"},
+        {"id": "drive-2", "name": "Bizz&Plans"},
+        {"id": "drive-3", "name": "meeting-artifacts"},
+    ]
+    assert [c.get("pageToken") for c in fake_service.drives_api.list_calls] == [None, "page-2"]
+
+
+def test_drive_list_drives_rejects_non_positive_limit():
+    with pytest.raises(ValueError):
+        client.drive_list_drives(max_results=0)
 
 
 def test_gsuite_client_drive_search_supports_full_text(monkeypatch):
@@ -1372,6 +1437,71 @@ def test_docs_bullets_requires_revision_for_writes(monkeypatch):
     assert fake_service.documents_api.batch_update_calls == []
 
 
+def test_docs_create_with_folder_creates_through_drive(monkeypatch):
+    fake_drive = _FakeDriveService()
+    fake_docs = _FakeDocsService([])
+    monkeypatch.setattr(client, "get_drive_service", lambda: fake_drive)
+    monkeypatch.setattr(client, "get_docs_service", lambda: fake_docs)
+
+    result = client.docs_create("Design Notes", content="Hello", folder_id="drive-123")
+
+    create_call = fake_drive.files_api.create_calls[0]
+    assert create_call["body"] == {
+        "name": "Design Notes",
+        "mimeType": "application/vnd.google-apps.document",
+        "parents": ["drive-123"],
+    }
+    assert create_call["supportsAllDrives"] is True
+    assert fake_docs.documents_api.batch_update_calls == [
+        {
+            "documentId": "file-123",
+            "body": {"requests": [{"insertText": {"location": {"index": 1}, "text": "Hello"}}]},
+        }
+    ]
+    assert result == {
+        "document_id": "file-123",
+        "title": "Design Notes",
+        "url": "https://docs.google.com/document/d/file-123/edit",
+    }
+
+
+def test_sheets_create_with_folder_creates_through_drive_then_writes(monkeypatch):
+    fake_drive = _FakeDriveService()
+    fake_sheets = _FakeSheetsService()
+    monkeypatch.setattr(client, "get_drive_service", lambda: fake_drive)
+    monkeypatch.setattr(client, "get_sheets_service", lambda: fake_sheets)
+
+    result = client.sheets_create("Budget", content=[["a", "b"]], folder_id="drive-123")
+
+    create_call = fake_drive.files_api.create_calls[0]
+    assert create_call["body"]["mimeType"] == "application/vnd.google-apps.spreadsheet"
+    assert create_call["body"]["parents"] == ["drive-123"]
+    assert fake_sheets.spreadsheets_api.values_api.update_calls[0]["spreadsheetId"] == "file-123"
+    assert result["spreadsheet_id"] == "file-123"
+    assert result["url"] == "https://docs.google.com/spreadsheets/d/file-123/edit"
+
+
+def test_slides_create_with_folder_creates_through_drive(monkeypatch):
+    fake_drive = _FakeDriveService()
+    monkeypatch.setattr(client, "get_drive_service", lambda: fake_drive)
+    monkeypatch.setattr(
+        client,
+        "get_slides_service",
+        lambda: (_ for _ in ()).throw(AssertionError("Slides API should not be used")),
+    )
+
+    result = client.slides_create("Roadmap", folder_id="drive-123")
+
+    create_call = fake_drive.files_api.create_calls[0]
+    assert create_call["body"]["mimeType"] == "application/vnd.google-apps.presentation"
+    assert create_call["body"]["parents"] == ["drive-123"]
+    assert result == {
+        "presentation_id": "file-123",
+        "title": "Roadmap",
+        "url": "https://docs.google.com/presentation/d/file-123/edit",
+    }
+
+
 def test_docs_append_passes_expected_revision_id_through(monkeypatch):
     fake_service = _FakeDocsService([])
     monkeypatch.setattr(client, "get_docs_service", lambda: fake_service)
@@ -1409,6 +1539,367 @@ def test_docs_insert_passes_expected_revision_id_through(monkeypatch):
     assert len(calls) == 2
     assert "writeControl" not in calls[0]["body"]
     assert calls[1]["body"]["writeControl"] == {"requiredRevisionId": "rev-99"}
+
+
+class _FakeEventsApi:
+    def __init__(self, insert_result=None, update_result=None, get_results=None):
+        self.insert_calls: list[dict] = []
+        self.update_calls: list[dict] = []
+        self.get_calls: list[dict] = []
+        self.delete_calls: list[dict] = []
+        self._insert_result = insert_result or {}
+        self._update_result = update_result or {}
+        self._get_results = list(get_results or [])
+
+    def insert(self, **kwargs):
+        self.insert_calls.append(kwargs)
+        return _CreateRequest(self._insert_result)
+
+    def update(self, **kwargs):
+        self.update_calls.append(kwargs)
+        return _CreateRequest(self._update_result)
+
+    def get(self, **kwargs):
+        self.get_calls.append(kwargs)
+        return _CreateRequest(self._get_results.pop(0) if self._get_results else {})
+
+    def delete(self, **kwargs):
+        self.delete_calls.append(kwargs)
+        return _CreateRequest({})
+
+
+class _FakeCalendarService:
+    def __init__(self, **kwargs):
+        self.events_api = _FakeEventsApi(**kwargs)
+
+    def events(self):
+        return self.events_api
+
+
+def test_calendar_create_event_without_conference_leaves_body_untouched(monkeypatch):
+    fake_service = _FakeCalendarService(
+        insert_result={"id": "event-123", "htmlLink": "https://calendar.google.com/event-123"}
+    )
+    monkeypatch.setattr(client, "get_calendar_service", lambda: fake_service)
+
+    result = client.calendar_create_event("Standup", "2026-09-01T09:00:00Z", "2026-09-01T09:30:00Z")
+
+    insert_call = fake_service.events_api.insert_calls[0]
+    assert "conferenceData" not in insert_call["body"]
+    assert "conferenceDataVersion" not in insert_call
+    assert fake_service.events_api.get_calls == []
+    assert result == {
+        "id": "event-123",
+        "html_link": "https://calendar.google.com/event-123",
+        "meet_link": "",
+    }
+
+
+def test_calendar_create_event_requests_google_meet(monkeypatch):
+    fake_service = _FakeCalendarService(
+        insert_result={
+            "id": "event-123",
+            "htmlLink": "https://calendar.google.com/event-123",
+            "hangoutLink": "https://meet.google.com/abc-defg-hij",
+        }
+    )
+    monkeypatch.setattr(client, "get_calendar_service", lambda: fake_service)
+
+    result = client.calendar_create_event(
+        "Standup", "2026-09-01T09:00:00Z", "2026-09-01T09:30:00Z", conference=True
+    )
+
+    insert_call = fake_service.events_api.insert_calls[0]
+    # Without conferenceDataVersion=1 Calendar drops conferenceData silently.
+    assert insert_call["conferenceDataVersion"] == 1
+    create_request = insert_call["body"]["conferenceData"]["createRequest"]
+    assert create_request["conferenceSolutionKey"] == {"type": "hangoutsMeet"}
+    assert create_request["requestId"] == uuid.UUID(create_request["requestId"]).hex
+    assert result["meet_link"] == "https://meet.google.com/abc-defg-hij"
+
+
+def test_calendar_create_event_mints_a_fresh_request_id_per_event(monkeypatch):
+    fake_service = _FakeCalendarService(insert_result={"id": "event-123"})
+    monkeypatch.setattr(client, "get_calendar_service", lambda: fake_service)
+
+    client.calendar_create_event(
+        "A", "2026-09-01T09:00:00Z", "2026-09-01T09:30:00Z", conference=True
+    )
+    client.calendar_create_event(
+        "B", "2026-09-02T09:00:00Z", "2026-09-02T09:30:00Z", conference=True
+    )
+
+    request_ids = {
+        call["body"]["conferenceData"]["createRequest"]["requestId"]
+        for call in fake_service.events_api.insert_calls
+    }
+    assert len(request_ids) == 2
+
+
+def test_calendar_create_event_refetches_a_pending_meet_link(monkeypatch):
+    fake_service = _FakeCalendarService(
+        insert_result={
+            "id": "event-123",
+            "conferenceData": {"createRequest": {"status": {"statusCode": "pending"}}},
+        },
+        get_results=[
+            {
+                "id": "event-123",
+                "conferenceData": {
+                    "entryPoints": [
+                        {"entryPointType": "phone", "uri": "tel:+1-650-555-0100"},
+                        {"entryPointType": "video", "uri": "https://meet.google.com/abc-defg-hij"},
+                    ]
+                },
+            }
+        ],
+    )
+    monkeypatch.setattr(client, "get_calendar_service", lambda: fake_service)
+
+    result = client.calendar_create_event(
+        "Standup", "2026-09-01T09:00:00Z", "2026-09-01T09:30:00Z", conference=True
+    )
+
+    assert len(fake_service.events_api.get_calls) == 1
+    assert result["meet_link"] == "https://meet.google.com/abc-defg-hij"
+
+
+def test_calendar_update_event_adds_meet_when_event_has_none(monkeypatch):
+    fake_service = _FakeCalendarService(
+        get_results=[{"id": "event-123", "summary": "Standup"}],
+        update_result={
+            "id": "event-123",
+            "htmlLink": "https://calendar.google.com/event-123",
+            "hangoutLink": "https://meet.google.com/abc-defg-hij",
+        },
+    )
+    monkeypatch.setattr(client, "get_calendar_service", lambda: fake_service)
+
+    result = client.calendar_update_event("event-123", conference=True)
+
+    update_call = fake_service.events_api.update_calls[0]
+    assert update_call["conferenceDataVersion"] == 1
+    assert update_call["body"]["conferenceData"]["createRequest"]["conferenceSolutionKey"] == {
+        "type": "hangoutsMeet"
+    }
+    assert result["meet_link"] == "https://meet.google.com/abc-defg-hij"
+
+
+def test_calendar_update_event_keeps_an_existing_conference(monkeypatch):
+    existing = {
+        "id": "event-123",
+        "summary": "Standup",
+        "conferenceData": {
+            "conferenceId": "abc-defg-hij",
+            "entryPoints": [
+                {"entryPointType": "video", "uri": "https://meet.google.com/abc-defg-hij"}
+            ],
+        },
+    }
+    fake_service = _FakeCalendarService(
+        get_results=[existing],
+        update_result={
+            "id": "event-123",
+            "hangoutLink": "https://meet.google.com/abc-defg-hij",
+        },
+    )
+    monkeypatch.setattr(client, "get_calendar_service", lambda: fake_service)
+
+    client.calendar_update_event("event-123", summary="Standup v2", conference=True)
+
+    conference_data = fake_service.events_api.update_calls[0]["body"]["conferenceData"]
+    assert "createRequest" not in conference_data
+    assert conference_data["conferenceId"] == "abc-defg-hij"
+
+
+def test_calendar_update_event_without_conference_omits_the_version_flag(monkeypatch):
+    fake_service = _FakeCalendarService(
+        get_results=[{"id": "event-123", "summary": "Standup"}],
+        update_result={"id": "event-123", "htmlLink": "https://calendar.google.com/event-123"},
+    )
+    monkeypatch.setattr(client, "get_calendar_service", lambda: fake_service)
+
+    result = client.calendar_update_event("event-123", summary="Standup v2")
+
+    assert "conferenceDataVersion" not in fake_service.events_api.update_calls[0]
+    assert result["meet_link"] == ""
+
+
+def _calendar_service_with_attendee(**kwargs):
+    defaults = {
+        "get_results": [
+            {
+                "id": "event-123",
+                "summary": "Standup",
+                "attendees": [{"email": "outside@example.com"}],
+            }
+        ],
+        "update_result": {"id": "event-123", "htmlLink": "https://calendar.google.com/event-123"},
+    }
+    defaults.update(kwargs)
+    return _FakeCalendarService(**defaults)
+
+
+def test_calendar_update_event_notifies_attendees_of_a_time_change(monkeypatch):
+    fake_service = _calendar_service_with_attendee()
+    monkeypatch.setattr(client, "get_calendar_service", lambda: fake_service)
+
+    client.calendar_update_event(
+        "event-123", start="2026-09-01T10:00:00Z", end="2026-09-01T11:00:00Z"
+    )
+
+    assert fake_service.events_api.update_calls[0]["sendUpdates"] == "all"
+
+
+def test_calendar_update_event_stays_quiet_for_a_description_edit(monkeypatch):
+    fake_service = _calendar_service_with_attendee()
+    monkeypatch.setattr(client, "get_calendar_service", lambda: fake_service)
+
+    client.calendar_update_event("event-123", description="typo fixed")
+
+    assert fake_service.events_api.update_calls[0]["sendUpdates"] == "none"
+
+
+def test_calendar_update_event_stays_quiet_when_there_are_no_attendees(monkeypatch):
+    fake_service = _FakeCalendarService(
+        get_results=[{"id": "event-123", "summary": "Solo focus block"}],
+        update_result={"id": "event-123"},
+    )
+    monkeypatch.setattr(client, "get_calendar_service", lambda: fake_service)
+
+    client.calendar_update_event("event-123", start="2026-09-01T10:00:00Z")
+
+    assert fake_service.events_api.update_calls[0]["sendUpdates"] == "none"
+
+
+def test_calendar_update_event_notify_false_silences_a_material_change(monkeypatch):
+    fake_service = _calendar_service_with_attendee()
+    monkeypatch.setattr(client, "get_calendar_service", lambda: fake_service)
+
+    client.calendar_update_event("event-123", start="2026-09-01T10:00:00Z", notify=False)
+
+    assert fake_service.events_api.update_calls[0]["sendUpdates"] == "none"
+
+
+def test_calendar_update_event_notify_true_announces_a_trivial_change(monkeypatch):
+    fake_service = _calendar_service_with_attendee()
+    monkeypatch.setattr(client, "get_calendar_service", lambda: fake_service)
+
+    client.calendar_update_event("event-123", description="typo fixed", notify=True)
+
+    assert fake_service.events_api.update_calls[0]["sendUpdates"] == "all"
+
+
+def test_calendar_update_event_stays_quiet_when_a_field_is_blank(monkeypatch):
+    # calendar_update_event writes a field only when it is truthy, so "" edits
+    # nothing. Notifying here would mail everyone about a no-op.
+    fake_service = _calendar_service_with_attendee()
+    monkeypatch.setattr(client, "get_calendar_service", lambda: fake_service)
+
+    client.calendar_update_event("event-123", location="", summary="")
+
+    update_call = fake_service.events_api.update_calls[0]
+    assert update_call["sendUpdates"] == "none"
+    assert update_call["body"]["summary"] == "Standup"
+    assert "location" not in update_call["body"]
+
+
+def test_calendar_update_event_stays_quiet_when_the_guest_is_already_invited(monkeypatch):
+    fake_service = _calendar_service_with_attendee()
+    monkeypatch.setattr(client, "get_calendar_service", lambda: fake_service)
+
+    client.calendar_update_event("event-123", add_attendees=["OUTSIDE@example.com"])
+
+    update_call = fake_service.events_api.update_calls[0]
+    assert update_call["sendUpdates"] == "none"
+    assert update_call["body"]["attendees"] == [{"email": "outside@example.com"}]
+
+
+def test_calendar_update_event_notifies_the_first_guest_on_a_solo_event(monkeypatch):
+    # The decision reads the merged attendee list, so an event that had nobody
+    # still notifies the guest it just gained.
+    fake_service = _FakeCalendarService(
+        get_results=[{"id": "event-123", "summary": "Solo focus block"}],
+        update_result={"id": "event-123"},
+    )
+    monkeypatch.setattr(client, "get_calendar_service", lambda: fake_service)
+
+    client.calendar_update_event("event-123", add_attendees=["new@example.com"])
+
+    assert fake_service.events_api.update_calls[0]["sendUpdates"] == "all"
+
+
+def test_calendar_update_event_appends_a_repeated_new_guest_once(monkeypatch):
+    fake_service = _calendar_service_with_attendee()
+    monkeypatch.setattr(client, "get_calendar_service", lambda: fake_service)
+
+    client.calendar_update_event("event-123", add_attendees=["new@example.com", "NEW@example.com"])
+
+    assert fake_service.events_api.update_calls[0]["body"]["attendees"] == [
+        {"email": "outside@example.com"},
+        {"email": "new@example.com"},
+    ]
+
+
+def test_calendar_update_event_still_notifies_when_adding_attendees(monkeypatch):
+    fake_service = _calendar_service_with_attendee()
+    monkeypatch.setattr(client, "get_calendar_service", lambda: fake_service)
+
+    client.calendar_update_event("event-123", add_attendees=["new@example.com"])
+
+    assert fake_service.events_api.update_calls[0]["sendUpdates"] == "all"
+
+
+def test_calendar_update_event_notifies_when_a_meet_is_added(monkeypatch):
+    fake_service = _calendar_service_with_attendee(
+        update_result={"id": "event-123", "hangoutLink": "https://meet.google.com/abc-defg-hij"}
+    )
+    monkeypatch.setattr(client, "get_calendar_service", lambda: fake_service)
+
+    client.calendar_update_event("event-123", conference=True)
+
+    assert fake_service.events_api.update_calls[0]["sendUpdates"] == "all"
+
+
+def test_calendar_update_event_stays_quiet_when_the_meet_already_existed(monkeypatch):
+    fake_service = _calendar_service_with_attendee(
+        get_results=[
+            {
+                "id": "event-123",
+                "summary": "Standup",
+                "attendees": [{"email": "outside@example.com"}],
+                "conferenceData": {"conferenceId": "abc-defg-hij"},
+            }
+        ]
+    )
+    monkeypatch.setattr(client, "get_calendar_service", lambda: fake_service)
+
+    client.calendar_update_event("event-123", conference=True)
+
+    assert fake_service.events_api.update_calls[0]["sendUpdates"] == "none"
+
+
+def test_calendar_delete_event_notifies_attendees_by_default(monkeypatch):
+    fake_service = _FakeCalendarService()
+    monkeypatch.setattr(client, "get_calendar_service", lambda: fake_service)
+
+    result = client.calendar_delete_event("event-123")
+
+    assert fake_service.events_api.delete_calls == [
+        {"calendarId": "primary", "eventId": "event-123", "sendUpdates": "all"}
+    ]
+    assert result == {"id": "event-123", "deleted": True}
+
+
+def test_calendar_delete_event_can_cancel_silently(monkeypatch):
+    fake_service = _FakeCalendarService()
+    monkeypatch.setattr(client, "get_calendar_service", lambda: fake_service)
+
+    client.calendar_delete_event("event-123", calendar_id="team@example.com", notify=False)
+
+    assert fake_service.events_api.delete_calls == [
+        {"calendarId": "team@example.com", "eventId": "event-123", "sendUpdates": "none"}
+    ]
 
 
 def test_people_service_uses_proxy_transport(monkeypatch):
