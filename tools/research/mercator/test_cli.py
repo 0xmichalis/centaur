@@ -9,6 +9,29 @@ from typer.testing import CliRunner
 from mercator import cli
 
 
+def test_search_explains_how_to_pass_attribution_with_the_cli(monkeypatch):
+    client = MagicMock()
+    client.__enter__.return_value = client
+    client.search.return_value = {
+        "id": "11111111-1111-4111-8111-111111111111",
+        "endpoints": [],
+        "next_action": "Call quote_plan with this id.",
+    }
+    monkeypatch.setattr(cli, "_client", lambda: client)
+
+    result = CliRunner().invoke(cli.app, ["search", "current weather"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == {
+        "id": "11111111-1111-4111-8111-111111111111",
+        "endpoints": [],
+        "next_action": (
+            "Call quote_plan with this id. In this CLI, pass the returned id via --search-id "
+            "to quote and submit. Keep id and searchId outside the plan JSON."
+        ),
+    }
+
+
 def test_submit_passes_the_plan_spend_limit_and_idempotency_key(monkeypatch, tmp_path):
     plan = {
         "nodes": [{"id": "weather", "serviceId": "openweather", "method": "POST", "path": "/w"}]

@@ -77,7 +77,13 @@ def search(
     ),
 ) -> None:
     """Find and rank service endpoints for an outcome. Free."""
-    _echo(_run(lambda client: client.search(query, limit=limit)))
+    result = _run(lambda client: client.search(query, limit=limit))
+    result["next_action"] = (
+        f"{result.get('next_action', '')} "
+        "In this CLI, pass the returned id via --search-id to quote and submit. "
+        "Keep id and searchId outside the plan JSON."
+    ).strip()
+    _echo(result)
 
 
 @app.command()
