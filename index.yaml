@@ -3,6 +3,27 @@ entries:
   centaur:
   - apiVersion: v2
     appVersion: 0.1.0
+    created: "2026-10-19T20:04:48.208180178Z"
+    dependencies:
+    - alias: onepasswordConnect
+      condition: onepasswordConnect.connect.create
+      name: connect
+      repository: https://1password.github.io/connect-helm-charts
+      version: 2.4.1
+    - alias: agentSandbox
+      condition: agentSandbox.enabled
+      name: agent-sandbox
+      repository: file://charts/agent-sandbox
+      version: 0.1.0
+    description: Helm chart for the trusted Centaur control plane
+    digest: 3dca012e84573abe5f9baba956e9c15f592c5ecee3e9f140b8adf541105103eb
+    name: centaur
+    type: application
+    urls:
+    - https://github.com/paradigmxyz/centaur/releases/download/centaur-0.1.179/centaur-0.1.179.tgz
+    version: 0.1.179
+  - apiVersion: v2
+    appVersion: 0.1.0
     created: "2026-10-19T19:26:16.227029705Z"
     dependencies:
     - alias: onepasswordConnect
@@ -2537,4 +2558,4 @@ entries:
     urls:
     - https://paradigmxyz.github.io/centaur/centaur-0.1.38.tgz
     version: 0.1.38
-generated: "2026-10-19T19:26:16.227183376Z"
+generated: "2026-10-19T20:04:48.2083137Z"
