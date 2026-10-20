@@ -1,5 +1,57 @@
 # syntax=docker/dockerfile:1.7
 
+# Rebuild Go CLIs rather than retaining the Go runtime baked into vendor binaries.
+FROM golang:1.27.3-bookworm@sha256:5c3e9b43cfd3bb95c7937462e29d87ada57b481a96fa23ad0eb61778d7a00110 AS go-tools
+
+ENV GOTOOLCHAIN=local
+ENV CGO_ENABLED=0
+
+ARG GH_VERSION=2.102.0
+ARG GH_COMMIT=fc4b137cdef0a6bd28fd461b7cf9c84a5812a8cd
+ARG DOCKER_VERSION=29.8.2
+ARG DOCKER_COMMIT=7fc2dff9bceb96b266a3b2c3117c0955a0d9e616
+ARG KUBECTL_VERSION=v1.34.2
+ARG KUBECTL_COMMIT=8cc511e399b929453cd98ae65b419c3cc227ec79
+
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    git init /src/gh \
+    && cd /src/gh \
+    && git remote add origin https://github.com/cli/cli.git \
+    && git fetch --depth=1 origin "${GH_COMMIT}" \
+    && git checkout --detach FETCH_HEAD \
+    && GH_VERSION="${GH_VERSION}" make bin/gh \
+    && install -D bin/gh /out/gh
+
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    git init /go/src/github.com/docker/cli \
+    && cd /go/src/github.com/docker/cli \
+    && git remote add origin https://github.com/docker/cli.git \
+    && git fetch --depth=1 origin "${DOCKER_COMMIT}" \
+    && git checkout --detach FETCH_HEAD \
+    && VERSION="${DOCKER_VERSION}" sh scripts/build/binary \
+    && install build/docker /out/docker
+
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    apt-get update && apt-get install -y --no-install-recommends rsync \
+    && rm -rf /var/lib/apt/lists/* \
+    && git init /src/kubernetes \
+    && cd /src/kubernetes \
+    && git remote add origin https://github.com/kubernetes/kubernetes.git \
+    && git fetch --depth=1 origin "${KUBECTL_COMMIT}" \
+    && git checkout --detach FETCH_HEAD \
+    && KUBE_GIT_VERSION="${KUBECTL_VERSION}" make WHAT=cmd/kubectl \
+    && install _output/bin/kubectl /out/kubectl
+
+# Fail the build if a tool silently selects a different Go compiler.
+RUN set -eu; for tool in /out/gh /out/docker /out/kubectl; do \
+      go version -m "${tool}" | head -n 1 | grep -F ': go1.27.3'; \
+    done \
+    && /out/gh --version | grep -F "${GH_VERSION}" \
+    && /out/docker --version | grep -F "${DOCKER_VERSION}" \
+    && /out/kubectl version --client=true | grep -F "${KUBECTL_VERSION#v}"
+
 FROM ubuntu:24.04 AS toolchain
 
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -94,7 +146,6 @@ ARG PI_CODING_AGENT_VERSION=1.0.0
 # Hermes Agent (NousResearch) — pinned by commit SHA per the dependency policy.
 ARG HERMES_AGENT_REF=e5e2fb8b2dbe1cae85aa5ad6ce45aef376016e43
 ARG NUSHELL_VERSION=0.112.2
-ARG KUBECTL_VERSION=v1.34.2
 ARG KACHE_VERSION=v0.7.0
 # Bootstrap pnpm for agents working in JS monorepos. The exact baked version
 # doesn't constrain repos: when a repo's `packageManager` field declares a
@@ -103,18 +154,12 @@ ARG KACHE_VERSION=v0.7.0
 # egress a dependency install already needs.
 ARG PNPM_VERSION=11.5.3
 
-# ── kubectl ──────────────────────────────────────────────────────────────────
-RUN set -eux; \
-    kubectl_arch="$(case "$(dpkg --print-architecture)" in \
-      amd64) echo amd64 ;; \
-      arm64) echo arm64 ;; \
-      *) echo unsupported-architecture >&2; exit 1 ;; \
-    esac)"; \
-    curl -fsSL \
-      "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${kubectl_arch}/kubectl" \
-      -o /usr/local/bin/kubectl; \
-    chmod +x /usr/local/bin/kubectl; \
-    kubectl version --client=true | grep -F "${KUBECTL_VERSION#v}"
+# Replace the packaged executables as well as the standalone kubectl download.
+COPY --from=go-tools /out/gh /usr/bin/gh
+COPY --from=go-tools /out/docker /usr/bin/docker
+COPY --from=go-tools /out/kubectl /usr/local/bin/kubectl
+
+RUN gh --version && docker --version && kubectl version --client=true
 
 # ── AWS CLI v2 ─────────────────────────────────────────────────────────────
 RUN set -eux; \
