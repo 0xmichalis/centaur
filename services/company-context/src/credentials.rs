@@ -838,12 +838,15 @@ mod tests {
         assert!(credentials.principal_identity(3).await.unwrap().is_none());
 
         // Disabling an app hides the identities that reach its documents.
-        pool.execute("UPDATE oauth_apps SET enabled = false WHERE provider IN ('google', 'slack')")
-            .await
-            .unwrap();
+        pool.execute(
+            "UPDATE oauth_apps SET enabled = false WHERE provider IN ('google', 'slack', 'attio')",
+        )
+        .await
+        .unwrap();
         let ada = credentials.principal_identity(1).await.unwrap().unwrap();
         assert!(ada.slack_user_id.is_none());
         assert!(ada.google_subjects.is_empty());
+        assert!(ada.attio_subjects.is_empty());
         assert_eq!(ada.granola_subjects, ["GR-ADA", "GR-ADA-2"]);
 
         database.drop().await;

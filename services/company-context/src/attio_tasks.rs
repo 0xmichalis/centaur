@@ -9,13 +9,13 @@ use sqlx::{PgPool, Row};
 use tracing::{error, info, warn};
 
 use crate::{
-    attio::{CallRecording, Meeting},
+    attio::{AttioClient, CallRecording, Meeting},
     config::{
         ATTIO_CREDENTIALS_RECONCILE_TASK, ATTIO_DOCUMENT_ID_PREFIX, ATTIO_MEETING_EMBED_TASK,
         ATTIO_MEETINGS_FETCH_TASK, ATTIO_SYNC_TASK,
     },
     credentials::AttioCredential,
-    errors::{is_rejected, rejected},
+    errors::{denied, is_denied, is_rejected, rejected},
     extraction::{chunk_text, hex_sha256},
     tasks::{TaskState, bounded_error, run_task},
 };
@@ -173,18 +173,9 @@ async fn sync_workspace(
         .fetch_one(&state.pool)
         .await?;
         let now = Utc::now();
-        let ends_from = match watermark {
-            Some(watermark) => watermark - chrono::Duration::hours(REREAD_HOURS),
-            None => now - chrono::Duration::days(state.config.attio_initial_lookback_days as i64),
-        };
-        // Upcoming meetings are left to Calendar; each is listed once it starts.
-        let meetings = state
-            .attio
-            .list_meetings(&credential.access_token, ends_from, now)
-            .await?
-            .into_iter()
-            .filter(|meeting| !meeting.id.meeting_id.is_empty())
-            .collect::<Vec<_>>();
+        let ends_from = listing_start(watermark, now, state.config.attio_initial_lookback_days);
+        let meetings =
+            list_meetings(&state.attio, &credential.access_token, ends_from, now).await?;
         for batch in meetings.chunks(MEETINGS_FETCH_BATCH_SIZE) {
             let ids = batch
                 .iter()
@@ -255,7 +246,9 @@ async fn sync_workspace(
             {
                 error!(event = "company_context_failure_record_failed", scope, error = %db_error);
             }
-            if is_rejected(&error) {
+            // The watermark stays put, so the meetings are listed again once
+            // the credential is fixed.
+            if is_rejected(&error) || is_denied(&error) {
                 warn!(
                     event = "company_context_attio_sync_rejected",
                     task_id = ctx.task_id(),
@@ -269,9 +262,57 @@ async fn sync_workspace(
     }
 }
 
+/// Where a listing starts: a window before the previous listing, or the
+/// initial lookback without one.
+fn listing_start(
+    watermark: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    initial_lookback_days: usize,
+) -> DateTime<Utc> {
+    match watermark {
+        Some(watermark) => watermark - chrono::Duration::hours(REREAD_HOURS),
+        None => now - chrono::Duration::days(initial_lookback_days as i64),
+    }
+}
+
+/// Lists the meetings that started before `now` and ended at or after
+/// `ends_from`. Upcoming meetings are left to Calendar; each is listed once it
+/// starts. Fails as denied if the credential cannot read call recordings, which
+/// listing meetings does not need, so that the checkpoint does not advance past
+/// meetings whose transcripts could not be read.
+async fn list_meetings(
+    attio: &AttioClient,
+    token: &str,
+    ends_from: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<Vec<Meeting>> {
+    let meetings = attio
+        .list_meetings(token, ends_from, now)
+        .await?
+        .into_iter()
+        .filter(|meeting| !meeting.id.meeting_id.is_empty())
+        .collect::<Vec<_>>();
+    if let Some(meeting) = meetings.first() {
+        match attio
+            .list_call_recordings(token, &meeting.id.meeting_id)
+            .await
+        {
+            Err(error) if is_denied(&error) => {
+                return Err(denied(format!(
+                    "Attio credential cannot read call recordings: {error}"
+                )));
+            }
+            // The meeting itself may have been deleted meanwhile.
+            Err(error) if !is_rejected(&error) => return Err(error),
+            _ => {}
+        }
+    }
+    Ok(meetings)
+}
+
 /// Fetches the transcripts of a batch of meetings and stages the meetings
-/// whose content changed. A meeting Attio refuses is skipped until a later
-/// sync lists it again.
+/// whose content changed. A meeting Attio cannot return, such as one deleted
+/// since it was listed, is skipped; a refused credential fails the task.
 async fn fetch_meetings(
     state: &TaskState,
     params: MeetingsFetchParams,
@@ -284,20 +325,21 @@ async fn fetch_meetings(
     let mut staged = 0;
     for meeting in &params.meetings {
         let meeting_id = &meeting.id.meeting_id;
-        let recordings = match completed_recordings(state, &credential, meeting_id).await {
-            Ok(recordings) => recordings,
-            Err(error) if is_rejected(&error) => {
-                warn!(
-                    event = "company_context_attio_meeting_rejected",
-                    task_id = ctx.task_id(),
-                    credential_id = credential.id,
-                    meeting_id,
-                    error = %error
-                );
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
+        let recordings =
+            match completed_recordings(&state.attio, &credential.access_token, meeting_id).await {
+                Ok(recordings) => recordings,
+                Err(error) if is_rejected(&error) => {
+                    warn!(
+                        event = "company_context_attio_meeting_rejected",
+                        task_id = ctx.task_id(),
+                        credential_id = credential.id,
+                        meeting_id,
+                        error = %error
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
         let Some(revision) = stage_meeting(&state.pool, &credential, meeting, &recordings).await?
         else {
             continue;
@@ -335,27 +377,18 @@ async fn fetch_meetings(
 
 /// The meeting's completed call recordings, with their transcripts.
 async fn completed_recordings(
-    state: &TaskState,
-    credential: &AttioCredential,
+    attio: &AttioClient,
+    token: &str,
     meeting_id: &str,
 ) -> Result<Vec<CallRecording>> {
     let mut recordings = Vec::new();
-    for listed in state
-        .attio
-        .list_call_recordings(&credential.access_token, meeting_id)
-        .await?
-    {
+    for listed in attio.list_call_recordings(token, meeting_id).await? {
         if listed.status != "completed" || listed.id.call_recording_id.is_empty() {
             continue;
         }
         recordings.push(
-            state
-                .attio
-                .call_recording(
-                    &credential.access_token,
-                    meeting_id,
-                    &listed.id.call_recording_id,
-                )
+            attio
+                .call_recording(token, meeting_id, &listed.id.call_recording_id)
                 .await?,
         );
     }
@@ -795,7 +828,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        attio::{MeetingId, MeetingTime, Participant, Segment, Speaker, Transcript},
+        attio::{MeetingId, MeetingTime, Participant, Segment, Speaker, Transcript, fake},
         test_support::TestDatabase,
     };
 
@@ -816,11 +849,11 @@ mod tests {
             description: description.to_owned(),
             start: MeetingTime {
                 datetime: Some("2026-07-08T15:30:00Z".to_owned()),
-                date: None,
+                ..MeetingTime::default()
             },
             end: MeetingTime {
                 datetime: Some("2026-07-08T16:00:00Z".to_owned()),
-                date: None,
+                ..MeetingTime::default()
             },
             participants: vec![
                 Participant {
@@ -855,6 +888,68 @@ mod tests {
             }),
             ..CallRecording::default()
         }
+    }
+
+    fn at(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value).unwrap().to_utc()
+    }
+
+    #[test]
+    fn listings_reread_a_window_before_the_previous_one() {
+        let now = at("2026-07-10T00:00:00Z");
+        assert_eq!(
+            listing_start(Some(at("2026-07-09T00:00:00Z")), now, 365),
+            at("2026-07-06T00:00:00Z")
+        );
+        assert_eq!(listing_start(None, now, 30), at("2026-06-10T00:00:00Z"));
+    }
+
+    #[tokio::test]
+    async fn listing_fails_when_call_recordings_are_refused() {
+        let (attio, server) = fake::serve().await;
+        let (from, now) = (at("2026-07-01T00:00:00Z"), at("2026-07-08T00:00:00Z"));
+        let meetings = list_meetings(&attio, "token-1", from, now).await.unwrap();
+        assert_eq!(meetings.len(), 2);
+        // Listing meetings succeeds without call_recording:read, but the sync
+        // must not advance past meetings whose transcripts it cannot read.
+        let refused = list_meetings(&attio, "no-recordings", from, now)
+            .await
+            .unwrap_err();
+        assert!(is_denied(&refused), "{refused}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn only_completed_recordings_are_fetched() {
+        let (attio, server) = fake::serve().await;
+        let recordings = completed_recordings(&attio, "token-1", "m-1")
+            .await
+            .unwrap();
+        assert_eq!(
+            recordings
+                .iter()
+                .map(|recording| recording.web_url.as_str())
+                .collect::<Vec<_>>(),
+            ["https://app.attio.com/r-1"]
+        );
+        assert!(
+            completed_recordings(&attio, "token-1", "m-2")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let gone = completed_recordings(&attio, "token-1", "m-gone")
+            .await
+            .unwrap_err();
+        assert!(is_rejected(&gone), "a deleted meeting is skipped");
+        let refused = completed_recordings(&attio, "no-recordings", "m-1")
+            .await
+            .unwrap_err();
+        assert!(
+            !is_rejected(&refused),
+            "a refused credential is not skipped"
+        );
+        server.abort();
     }
 
     #[test]
