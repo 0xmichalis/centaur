@@ -4,7 +4,9 @@
 //!
 //! A principal sees a document only while an active broker observation for its
 //! Slack user ID, or for the subject of a Google or Granola credential granted
-//! to it, still reaches the document's file, conversation, or Granola note.
+//! to it, still reaches the document's file, conversation, or Granola note. A
+//! Slack conversation is also visible to its members while any live
+//! credential observes it. Slack identities match by workspace and user ID.
 //! Calendar events are stored per Google identity, as Google showed them to it,
 //! and are visible only to that identity. A custom document is visible to
 //! the principals, roles, or everyone its readers name.
@@ -198,9 +200,14 @@ impl DataType {
     /// `None` if the principal can see none of the type's documents.
     fn subjects(self, identity: &PrincipalIdentity) -> Option<Vec<String>> {
         let subjects: Vec<String> = match self {
-            Self::SlackMessage | Self::SlackFile => {
-                identity.slack_user_id.iter().cloned().collect()
-            }
+            // Slack user IDs are scoped to a workspace, so the subject is the
+            // pair `[team_id, user_id]`.
+            Self::SlackMessage | Self::SlackFile => identity
+                .slack_team_id
+                .iter()
+                .zip(&identity.slack_user_id)
+                .flat_map(|(team_id, user_id)| [team_id.clone(), user_id.clone()])
+                .collect(),
             Self::DriveDoc | Self::CalendarEvent => identity.google_subjects.clone(),
             Self::GranolaNote => identity.granola_subjects.clone(),
             Self::CustomDoc => custom_readers(identity),
@@ -225,9 +232,9 @@ impl DataType {
                        'last_message_at', d.last_message_at
                    ) AS metadata"#,
                 visible: r#"d.conversation_id IN (
-                       SELECT o.conversation_id
-                       FROM company_context_data.slack_broker_observations o
-                       WHERE o.active AND o.provider_subject = ANY($2)
+                       SELECT r.conversation_id
+                       FROM company_context_data.slack_conversation_readers r
+                       WHERE r.team_id = $2[1] AND r.user_id = $2[2]
                    )"#,
                 // A channel day chunk matches a window its messages overlap.
                 starts_at: "d.first_message_at",
@@ -253,9 +260,9 @@ impl DataType {
                 visible: r#"d.file_id IN (
                        SELECT s.file_id
                        FROM company_context_data.slack_file_shares s
-                       JOIN company_context_data.slack_broker_observations o
-                         ON o.conversation_id = s.conversation_id
-                       WHERE o.active AND o.provider_subject = ANY($2)
+                       JOIN company_context_data.slack_conversation_readers r
+                         ON r.conversation_id = s.conversation_id
+                       WHERE r.team_id = $2[1] AND r.user_id = $2[2]
                    )"#,
                 starts_at: "d.source_created_at",
                 ends_at: "d.source_created_at",
@@ -266,9 +273,9 @@ impl DataType {
                     r#"d.file_id IN (
                        SELECT s.file_id
                        FROM company_context_data.slack_file_shares s
-                       JOIN company_context_data.slack_broker_observations o
-                         ON o.conversation_id = s.conversation_id
-                       WHERE o.active AND o.provider_subject = ANY($2)
+                       JOIN company_context_data.slack_conversation_readers r
+                         ON r.conversation_id = s.conversation_id
+                       WHERE r.team_id = $2[1] AND r.user_id = $2[2]
                          AND s.conversation_id = ANY($6)
                    )"#,
                 ),
@@ -1075,6 +1082,7 @@ mod tests {
     fn ada() -> PrincipalIdentity {
         PrincipalIdentity {
             slack_user_id: Some("U-ADA".to_owned()),
+            slack_team_id: Some("T1".to_owned()),
             google_subjects: vec!["G-ADA".to_owned()],
             granola_subjects: vec!["GR-ADA".to_owned()],
             ..Default::default()
@@ -1085,6 +1093,7 @@ mod tests {
     fn bob() -> PrincipalIdentity {
         PrincipalIdentity {
             slack_user_id: Some("U-BOB".to_owned()),
+            slack_team_id: Some("T1".to_owned()),
             google_subjects: Vec::new(),
             granola_subjects: vec!["GR-BOB".to_owned(), "GR-BOB-2".to_owned()],
             ..Default::default()
@@ -1139,6 +1148,9 @@ mod tests {
             INSERT INTO company_context_data.slack_broker_observations
                 (broker_credential_id, conversation_id, provider_subject, active)
             VALUES (10, 'C1', 'U-ADA', true), (10, 'C3', 'U-ADA', true), (11, 'C2', 'U-BOB', true);
+            INSERT INTO company_context_data.slack_broker_identities
+                (broker_credential_id, team_id, provider_subject)
+            VALUES (10, 'T1', 'U-ADA'), (11, 'T1', 'U-BOB');
             INSERT INTO company_context_system.slack_channel_days
                 (conversation_id, day, projection_version, content_hash, rendered_at)
             VALUES ('C1', '2024-01-02', 1, 'hash', now()), ('C2', '2024-01-02', 1, 'hash', now()),
@@ -1390,6 +1402,61 @@ mod tests {
         );
 
         server.abort();
+        database.drop().await;
+    }
+
+    #[tokio::test]
+    async fn slack_conversations_are_visible_to_members_while_observed() {
+        let Ok(database_url) = env::var("COMPANY_CONTEXT_TEST_DATABASE_URL") else {
+            eprintln!("skipping: set COMPANY_CONTEXT_TEST_DATABASE_URL to a ParadeDB Postgres URL");
+            return;
+        };
+        let database = TestDatabase::create(&database_url, "query_members").await;
+        let pool = &database.pool;
+        seed(pool).await;
+        // Carol has no Slack credential; she is a member of Bob's C2.
+        let carol = PrincipalIdentity {
+            slack_user_id: Some("U-CAROL".to_owned()),
+            slack_team_id: Some("T1".to_owned()),
+            ..Default::default()
+        };
+        pool.execute(
+            r#"
+            INSERT INTO company_context_data.slack_conversation_members
+                (conversation_id, team_id, user_id)
+            VALUES ('C2', 'T1', 'U-CAROL');
+            "#,
+        )
+        .await
+        .unwrap();
+        let query = json!({ "query": "falcon" });
+
+        // The same user ID in another workspace is someone else.
+        let elsewhere = PrincipalIdentity {
+            slack_team_id: Some("T2".to_owned()),
+            ..carol.clone()
+        };
+        assert!(ids(pool, None, &elsewhere, query.clone()).await.is_empty());
+
+        assert_eq!(
+            ids(pool, None, &carol, query.clone()).await,
+            ["slack-file:SF2", "slack:C2:2024-01-02:000000"]
+        );
+        assert!(
+            document(pool, &carol, "slack:C2:2024-01-02:000000")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // Membership grants access only while a live credential observes C2.
+        pool.execute(
+            "UPDATE company_context_data.slack_broker_observations SET active = FALSE WHERE conversation_id = 'C2'",
+        )
+        .await
+        .unwrap();
+        assert!(ids(pool, None, &carol, query).await.is_empty());
+
         database.drop().await;
     }
 

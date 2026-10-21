@@ -6,7 +6,7 @@ It also indexes Google Calendar events through the same Google broker credential
 
 It also indexes Granola meeting notes (title, summary, owner, and attendees) through each user's Granola MCP OAuth credential. Each sync lists the account's meetings from its checkpoint onward, fetches their details ten meetings at a time, and republishes a note only when its content changes. Transcripts are not indexed; the Granola tool fetches them on demand. Notes that no live Granola credential still observes are removed.
 
-It also discovers the public and private Slack channels (and, when enabled, direct messages) each user belongs to, through the same per-user Slack broker credentials the Rails Console Slack DM sync uses. The app's bot token (`SLACK_BOT_TOKEN`) is synced as one more credential: it discovers the public and private channels the bot is a member of and can sync their history and files, but never its direct messages. The bot is not a principal, so channels only it observes are indexed without being visible to anyone until a user credential observes them too. While `COMPANY_CONTEXT_SLACK_USER_IDS` is set, the bot is synced only if the limit lists the bot's Slack user ID. Each discovery records the credential's Slack identity and its channel memberships; channels that no live Slack credential still observes are removed, along with their messages. The first discovery each cycle to list a conversation syncs its message history. A sync reads the conversation's configured history days (`COMPANY_CONTEXT_SLACK_HISTORY_DAYS`, overridden per conversation by `COMPANY_CONTEXT_SLACK_CHANNEL_HISTORY_DAYS`) whenever part of that span has not been synchronized yet, so raising a value backfills the older history; lowering one keeps messages already synchronized. Otherwise it reads from its previous sync, always rereading the last 72 hours so edits within that window are picked up. Threads are synced whenever a parent message read this way shows a new reply; replies to threads started more than 72 hours earlier are not picked up. Only one sync reads a conversation at a time. Messages are stored privately in the system schema. Each discovery cycle also lists the workspace users through the app's bot token (`SLACK_BOT_TOKEN`), so documents show names instead of user IDs; the bot token needs the `users:read` scope and belongs to the same Slack app, so it shares the same rate-limit schedule. Users are removed once no live credential in their workspace remains. Slack tasks run on their own `company_context_slack` queue and worker, except thread syncs, which run in order on the `company_context_slack_threads` queue so a large backlog of threads does not delay discovery and history syncs.
+It also discovers the public and private Slack channels (and, when enabled, direct messages) each user belongs to, through the same per-user Slack broker credentials the Rails Console Slack DM sync uses. The app's bot token (`SLACK_BOT_TOKEN`) is synced as one more credential: it discovers the public and private channels the bot is a member of and can sync their history and files, but never its direct messages. While `COMPANY_CONTEXT_SLACK_USER_IDS` is set, the bot is synced only if the limit lists the bot's Slack user ID. Each discovery records the credential's Slack identity and its channel memberships; channels that no live Slack credential still observes are removed, along with their messages. The first discovery each cycle to list a conversation syncs its members and message history. Each sync replaces the conversation's members with those `conversations.members` lists, so everyone in a conversation can read it, including users without a Slack credential of their own and channels only the bot observes. A sync reads the conversation's configured history days (`COMPANY_CONTEXT_SLACK_HISTORY_DAYS`, overridden per conversation by `COMPANY_CONTEXT_SLACK_CHANNEL_HISTORY_DAYS`) whenever part of that span has not been synchronized yet, so raising a value backfills the older history; lowering one keeps messages already synchronized. Otherwise it reads from its previous sync, always rereading the last 72 hours so edits within that window are picked up. Threads are synced whenever a parent message read this way shows a new reply; replies to threads started more than 72 hours earlier are not picked up. Only one sync reads a conversation at a time. Messages are stored privately in the system schema. Each discovery cycle also lists the workspace users through the app's bot token (`SLACK_BOT_TOKEN`), so documents show names instead of user IDs; the bot token needs the `users:read` scope and belongs to the same Slack app, so it shares the same rate-limit schedule. Users are removed once no live credential in their workspace remains. Slack tasks run on their own `company_context_slack` queue and worker, except thread syncs, which run in order on the `company_context_slack_threads` queue so a large backlog of threads does not delay discovery and history syncs.
 
 It also projects documents written directly to the database, such as imports,
 notes, and memory (see [Custom documents](#custom-documents)). Each custom
@@ -92,7 +92,7 @@ Rollout limits (unset means no limit; values are comma-separated):
 - `COMPANY_CONTEXT_GOOGLE_DRIVE_USER_EMAILS`: sync only these Google credential emails.
 - `COMPANY_CONTEXT_GOOGLE_CALENDAR_USER_EMAILS`: sync calendars only through these Google credential emails.
 - `COMPANY_CONTEXT_GRANOLA_USER_EMAILS`: sync only these Granola credential emails.
-- `COMPANY_CONTEXT_SLACK_USER_IDS`: sync only these Slack user IDs; include the bot's user ID to keep syncing the bot token.
+- `COMPANY_CONTEXT_SLACK_USER_IDS`: sync only these Slack user IDs; include the bot's user ID to keep syncing the bot token. Synced conversations are visible to all their members, not only these users.
 - `COMPANY_CONTEXT_SLACK_CHANNEL_IDS`: sync only these Slack conversation IDs.
 - `COMPANY_CONTEXT_SLACK_CONVERSATION_TYPES` (default `public_channel,private_channel`): any of `public_channel`, `private_channel`, and `im`.
 
@@ -161,8 +161,10 @@ indexed PDFs are not downloaded again.
 Both query endpoints are authenticated with the same principal API JWT the
 Console mints for api-rs (`Authorization: Bearer <jwt>`); iron-proxy injects it
 into sandbox requests to this service. The token's subject names the principal,
-whose Slack user ID and granted broker credentials are looked up in the Rails
-Console database. The principal's Google and Granola identities are the
+whose Slack workspace and user ID and granted broker credentials are looked up
+in the Rails Console database. Slack user IDs are workspace-scoped, so a
+principal's Slack identity matches only when both its workspace and user ID do;
+a principal without a Slack workspace ID sees no Slack documents. The principal's Google and Granola identities are the
 subjects of the live Google and Granola broker credentials (from
 `COMPANY_CONTEXT_GOOGLE_OAUTH_APP_SLUG` and
 `COMPANY_CONTEXT_GRANOLA_OAUTH_APP_SLUG`) granted directly to it; role grants
@@ -170,7 +172,9 @@ and principal labels do not count. A document is visible only while an active
 broker observation for one of those identities still reaches its Drive file,
 Slack conversation (for Slack files, any conversation the file is shared in),
 or Granola note; a Calendar event only to the Google identity it was synced
-for. A custom document is visible to the principals its readers match. A principal without one of those identities sees no documents
+for. A Slack conversation is also visible to its members, as of its last sync,
+while any live credential observes it. A custom document is visible to the
+principals its readers match. A principal without one of those identities sees no documents
 of the corresponding types. Disabling an OAuth app in the Console removes the
 corresponding identity, so its documents stop being returned without being
 removed from the index.
