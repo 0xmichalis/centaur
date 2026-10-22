@@ -227,6 +227,54 @@ class Api::V1::SandboxAdminControllerTest < ActionDispatch::IntegrationTest
     assert_equal %w[E0GRID], api.team_ids
   end
 
+  test "an admin's Slack DM sandbox creates channel and user principals with session-derived identities" do
+    with_token(dm_proxy_for(users(:acme_admin))) do |headers|
+      post "/api/v1/sandbox/admin/principals",
+           params: { data: { kind: "slack_channel", slack_channel_id: " c0new12345 " } }, headers: headers, as: :json
+      assert_response :created
+      channel = Principal.find_by_oid!(json_body.dig("data", "id"))
+      assert_equal [ "slack-channel-c0new12345", "slack_channel", "C0NEW12345", nil ],
+                   [ channel.foreign_id, channel.kind, channel.slack_channel_id, channel.slack_team_id ]
+      assert_equal users(:acme_admin), channel.created_by
+      permission = channel.slack_channel_permissions.sole
+      assert_equal "C0NEW12345", permission.channel_id
+      assert permission.upload_enabled && permission.download_enabled && permission.history_enabled
+
+      post "/api/v1/sandbox/admin/principals",
+           params: { data: { kind: "slack_dm", slack_user_id: "U0NEWUSER1" } }, headers: headers, as: :json
+      assert_response :created
+      user = Principal.find_by_oid!(json_body.dig("data", "id"))
+      assert_equal [ "slack-user-t0123456789-u0newuser1", "slack_dm", "U0NEWUSER1", "T0123456789" ],
+                   [ user.foreign_id, user.kind, user.slack_user_id, user.slack_team_id ]
+
+      post "/api/v1/sandbox/admin/principals",
+           params: { data: { kind: "slack_channel", slack_channel_id: "C0NEW12345" } }, headers: headers, as: :json
+      assert_response :unprocessable_entity
+    end
+  end
+
+  test "sandbox admin principal creation accepts only Slack channel and user identities" do
+    with_token(dm_proxy_for(users(:acme_admin))) do |headers|
+      [
+        [ { kind: "console_user", slack_channel_id: "C0NEW12345" }, :bad_request ],
+        [ { kind: "slack_channel", slack_channel_id: "D0NEW12345" }, :bad_request ],
+        [ { kind: "slack_dm", slack_user_id: "C0NEW12345" }, :unprocessable_entity ]
+      ].each do |data, status|
+        assert_no_difference "Principal.count" do
+          post "/api/v1/sandbox/admin/principals", params: { data: data }, headers: headers, as: :json
+        end
+        assert_response status, data.inspect
+      end
+    end
+
+    with_token(dm_proxy_for(users(:member_user))) do |headers|
+      post "/api/v1/sandbox/admin/principals",
+           params: { data: { kind: "slack_channel", slack_channel_id: "C0NEW12345" } }, headers: headers, as: :json
+    end
+    assert_response :forbidden
+    assert_not Principal.exists?(foreign_id: "slack-channel-c0new12345")
+  end
+
   test "admin endpoints reject requests without a sandbox token" do
     with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do
       get "/api/v1/sandbox/admin/roles", headers: { "Authorization" => "Bearer iak_acme-ci-token" }

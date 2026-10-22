@@ -210,6 +210,21 @@ class ConsoleClient:
             )
         return self._admin_list_all(SANDBOX_ADMIN_PRINCIPALS_PATH)
 
+    def admin_create_principal(
+        self,
+        slack_channel_id: str | None = None,
+        slack_user_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a Slack channel or Slack user principal; the Console derives its foreign ID."""
+        if (slack_channel_id is None) == (slack_user_id is None):
+            raise ValueError("pass exactly one of slack_channel_id or slack_user_id")
+        data = (
+            {"kind": "slack_channel", "slack_channel_id": slack_channel_id}
+            if slack_channel_id is not None
+            else {"kind": "slack_dm", "slack_user_id": slack_user_id}
+        )
+        return self._admin_object(SANDBOX_ADMIN_PRINCIPALS_PATH, method="POST", json={"data": data})
+
     def admin_principal(self, principal: str) -> dict[str, Any]:
         """Read a principal by OID or foreign ID, with its roles and direct grants."""
         result = self._admin_object(
