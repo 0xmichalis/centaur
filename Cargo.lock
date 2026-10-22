@@ -519,6 +519,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.23.1",
+ "centaur-console-db",
  "centaur-iron-control",
  "centaur-iron-proxy",
  "centaur-sandbox-agent-k8s",
@@ -587,15 +588,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "centaur-console-db"
+version = "0.1.0"
+dependencies = [
+ "active-record-encryption",
+ "hex",
+ "rand 0.10.3",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "sqids",
+ "sqlx",
+ "tokio",
+]
+
+[[package]]
 name = "centaur-iron-control"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
+ "centaur-console-db",
  "centaur-iron-proxy",
  "reqwest",
  "serde",
  "serde_json",
  "serde_yaml",
+ "sqlx",
  "thiserror 2.0.21",
  "tokio",
  "urlencoding",
@@ -632,17 +650,16 @@ version = "0.1.0"
 dependencies = [
  "active-record-encryption",
  "axum",
+ "centaur-console-db",
  "chrono",
  "crc32fast",
  "hex",
  "jsonwebtoken",
  "metrics",
  "metrics-exporter-prometheus",
- "rand 0.10.3",
  "serde",
  "serde_json",
  "sha2 0.11.1",
- "sqids",
  "sqlx",
  "tokio",
  "tower",
