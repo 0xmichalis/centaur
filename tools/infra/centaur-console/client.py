@@ -15,6 +15,13 @@ SANDBOX_ADMIN_PRINCIPALS_PATH = "/api/v1/sandbox/admin/principals"
 SANDBOX_ADMIN_ROLES_PATH = "/api/v1/sandbox/admin/roles"
 SANDBOX_ADMIN_GRANTS_PATH = "/api/v1/sandbox/admin/grants"
 SANDBOX_ADMIN_SECRETS_PATH = "/api/v1/sandbox/admin/secrets"
+SANDBOX_ADMIN_STATIC_SECRETS_PATH = "/api/v1/sandbox/admin/static_secrets"
+SANDBOX_ADMIN_PG_DSN_SECRETS_PATH = "/api/v1/sandbox/admin/pg_dsn_secrets"
+# Secret kinds an admin can create and edit from a sandbox, by kind and grant key.
+ADMIN_WRITABLE_SECRET_PATHS = {
+    "static": SANDBOX_ADMIN_STATIC_SECRETS_PATH,
+    "pg_dsn": SANDBOX_ADMIN_PG_DSN_SECRETS_PATH,
+}
 SANDBOX_ADMIN_SLACK_EXTERNAL_TEAMS_PATH = "/api/v1/sandbox/admin/slack_external_teams"
 ADMIN_PAGE_LIMIT = 200
 
@@ -214,15 +221,23 @@ class ConsoleClient:
         self,
         slack_channel_id: str | None = None,
         slack_user_id: str | None = None,
+        workflow_name: str | None = None,
     ) -> dict[str, Any]:
-        """Create a Slack channel or Slack user principal; the Console derives its foreign ID."""
-        if (slack_channel_id is None) == (slack_user_id is None):
-            raise ValueError("pass exactly one of slack_channel_id or slack_user_id")
-        data = (
-            {"kind": "slack_channel", "slack_channel_id": slack_channel_id}
-            if slack_channel_id is not None
-            else {"kind": "slack_dm", "slack_user_id": slack_user_id}
-        )
+        """Create a Slack channel, Slack user, or workflow principal; the Console derives its foreign ID."""
+        identities = {
+            "slack_channel": ("slack_channel_id", slack_channel_id),
+            "slack_dm": ("slack_user_id", slack_user_id),
+            "workflow": ("workflow_name", workflow_name),
+        }
+        given = [
+            (kind, key, value) for kind, (key, value) in identities.items() if value is not None
+        ]
+        if len(given) != 1:
+            raise ValueError(
+                "pass exactly one of slack_channel_id, slack_user_id, or workflow_name"
+            )
+        kind, key, value = given[0]
+        data = {"kind": kind, key: value}
         return self._admin_object(SANDBOX_ADMIN_PRINCIPALS_PATH, method="POST", json={"data": data})
 
     def admin_principal(self, principal: str) -> dict[str, Any]:
@@ -265,6 +280,24 @@ class ConsoleClient:
     def admin_secrets(self, query: str | None = None) -> list[dict[str, Any]]:
         """List grantable secrets, optionally filtered by name or foreign ID."""
         return self._admin_list(SANDBOX_ADMIN_SECRETS_PATH, {"q": query} if query else None)
+
+    def admin_secret_document(self, secret: str) -> dict[str, Any]:
+        """Read a static or pg_dsn secret's document (never its value) by OID, foreign ID, or name."""
+        return self._admin_object(self._admin_writable_secret_path(secret))
+
+    def admin_create_secret(self, kind: str, data: dict[str, Any]) -> dict[str, Any]:
+        """Create a static or pg_dsn secret from a Console API document."""
+        if kind not in ADMIN_WRITABLE_SECRET_PATHS:
+            raise ValueError("kind must be static or pg_dsn")
+        return self._admin_object(
+            ADMIN_WRITABLE_SECRET_PATHS[kind], method="POST", json={"data": data}
+        )
+
+    def admin_update_secret(self, secret: str, data: dict[str, Any]) -> dict[str, Any]:
+        """Update the given fields of a static or pg_dsn secret; omitted fields are kept."""
+        return self._admin_object(
+            self._admin_writable_secret_path(secret), method="PATCH", json={"data": data}
+        )
 
     def admin_grant_secret(self, principal: str, secret: str) -> dict[str, Any]:
         """Grant a secret (OID, foreign ID, or name) directly to a principal."""
@@ -367,6 +400,13 @@ class ConsoleClient:
             found = "no secret" if not matches else "several secrets"
             raise RuntimeError(f"{found} matched {secret}; pass the secret OID")
         return matches[0]
+
+    def _admin_writable_secret_path(self, secret: str) -> str:
+        match = self._admin_secret(secret)
+        kind = match["grant_key"].removesuffix("_secret_id")
+        if kind not in ADMIN_WRITABLE_SECRET_PATHS:
+            raise RuntimeError(f"{secret} is a {kind} secret; edit it in the Console UI")
+        return f"{ADMIN_WRITABLE_SECRET_PATHS[kind]}/{match['id']}"
 
     def _admin_principal_and_role_ids(self, principal: str, role: str) -> tuple[str, str]:
         role_path = self._admin_ref_path(SANDBOX_ADMIN_ROLES_PATH, role, "role_")
