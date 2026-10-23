@@ -33,6 +33,7 @@ spec:
   replicas: {{ $companyContext.replicaCount }}
   strategy:
     type: Recreate
+    rollingUpdate: null
   selector:
     matchLabels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "company-context") | nindent 6 }}
