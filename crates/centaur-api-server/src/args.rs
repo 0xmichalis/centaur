@@ -592,10 +592,12 @@ impl IronControlArgs {
     }
 }
 
-/// How long a Console database read waits for a connection. The pool connects
-/// lazily, so an unreachable or misconfigured database first shows up here and
-/// should fail the turn promptly rather than after sqlx's 30 second default.
-const CONSOLE_DB_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a Console database read waits for a connection, including opening
+/// one: the pool connects lazily, so a burst of turns can open connections on
+/// the request path. This must outlast a resolver retry (glibc waits 5 seconds
+/// for a dropped DNS reply), while an unreachable database still fails the turn
+/// sooner than sqlx's 30 second default.
+const CONSOLE_DB_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Connection options for Console's database. Sessions are read-only:
 /// Console owns every write to its schema.
