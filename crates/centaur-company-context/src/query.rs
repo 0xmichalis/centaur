@@ -59,11 +59,12 @@ const EMBEDDING_TIMEOUT: Duration = Duration::from_secs(10);
 /// Database role with read-only access to `company_context_data` only.
 const QUERY_ROLE: &str = "centaur_company_context_v2_query";
 
-/// A custom document's metadata: the writer's, with its source and
-/// external ID.
+/// A custom document's metadata: the writer's, with its source, external
+/// ID, and the principal that wrote it through the API (null for rows
+/// written directly).
 macro_rules! custom_metadata {
     () => {
-        "d.metadata || jsonb_build_object('source', d.source, 'external_id', d.external_id)"
+        "d.metadata || jsonb_build_object('source', d.source, 'external_id', d.external_id, 'written_by', d.written_by)"
     };
 }
 
@@ -73,6 +74,9 @@ pub struct QueryState {
     pub credentials: Arc<ConsoleCredentials>,
     pub embeddings: EmbeddingsClient,
     pub jwt: Arc<JwtVerifier>,
+    /// Enqueues projection of custom documents written through the API;
+    /// absent while the custom indexer is disabled.
+    pub custom_projection: Option<absurd::Client>,
 }
 
 pub fn router(state: QueryState) -> Router {
@@ -446,11 +450,11 @@ impl Row {
     }
 }
 
-#[derive(Debug)]
-enum ApiError {
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ApiError {
     BadRequest(String),
     Unauthorized,
-    Forbidden,
+    Forbidden(String),
     NotFound,
     Internal,
 }
@@ -460,7 +464,7 @@ impl IntoResponse for ApiError {
         let (status, message) = match self {
             Self::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "invalid bearer token".to_owned()),
-            Self::Forbidden => (StatusCode::FORBIDDEN, "unknown principal".to_owned()),
+            Self::Forbidden(message) => (StatusCode::FORBIDDEN, message),
             Self::NotFound => (StatusCode::NOT_FOUND, "document not found".to_owned()),
             Self::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -472,7 +476,7 @@ impl IntoResponse for ApiError {
 }
 
 /// The identity of the principal named by the request's API JWT.
-async fn authenticate(
+pub(crate) async fn authenticate(
     state: &QueryState,
     headers: &HeaderMap,
 ) -> Result<PrincipalIdentity, ApiError> {
@@ -487,7 +491,7 @@ async fn authenticate(
             error!(event = "company_context_query_principal_failed", error = %format!("{error:#}"));
             ApiError::Internal
         })?
-        .ok_or(ApiError::Forbidden)
+        .ok_or_else(|| ApiError::Forbidden("unknown principal".to_owned()))
 }
 
 fn internal(event: &'static str) -> impl FnOnce(anyhow::Error) -> ApiError {
@@ -901,9 +905,14 @@ fn opaque_id(prefix: &str, sqids: &Sqids, id: i64) -> Option<String> {
     ))
 }
 
+/// The principal's Console opaque ID (`prn_...`).
+pub(crate) fn principal_oid(identity: &PrincipalIdentity) -> Option<String> {
+    opaque_id("prn", &PRINCIPAL_SQIDS, identity.principal_id)
+}
+
 /// The custom document readers that match the principal: everyone, the
 /// principal, and its roles, each by opaque ID and foreign ID.
-fn custom_readers(identity: &PrincipalIdentity) -> Vec<String> {
+pub(crate) fn custom_readers(identity: &PrincipalIdentity) -> Vec<String> {
     let principals = opaque_id("prn", &PRINCIPAL_SQIDS, identity.principal_id)
         .into_iter()
         .chain(identity.principal_foreign_id.clone());
