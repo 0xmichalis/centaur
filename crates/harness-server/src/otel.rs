@@ -1217,8 +1217,10 @@ fn anthropic_pricing(model: &str) -> Option<TokenPricing> {
 fn openai_pricing(model: &str) -> Option<TokenPricing> {
     // Standard rates for <=272K input tokens, verified against the model pages:
     // https://developers.openai.com/api/docs/models/gpt-6.1-sol
+    // https://developers.openai.com/api/docs/models/gpt-6.1-terra
     // https://developers.openai.com/api/docs/models/gpt-6-sol
     // https://developers.openai.com/api/docs/models/gpt-6-luna
+    // https://developers.openai.com/api/docs/models/gpt-6-astra
     if model.contains("gpt-6-1-sol") {
         return Some(TokenPricing {
             input_per_mtok: 2.0,
@@ -1226,6 +1228,15 @@ fn openai_pricing(model: &str) -> Option<TokenPricing> {
             cache_read_per_mtok: 0.1,
             output_per_mtok: 10.0,
             source: "centaur_estimate:openai:gpt-6.1-sol:standard-short-context",
+        });
+    }
+    if model.contains("gpt-6-1-terra") {
+        return Some(TokenPricing {
+            input_per_mtok: 1.0,
+            cache_creation_per_mtok: 1.25,
+            cache_read_per_mtok: 0.05,
+            output_per_mtok: 5.0,
+            source: "centaur_estimate:openai:gpt-6.1-terra:standard-short-context",
         });
     }
     if model.contains("gpt-6-sol") {
@@ -1251,7 +1262,7 @@ fn openai_pricing(model: &str) -> Option<TokenPricing> {
             input_per_mtok: 10.0,
             cache_creation_per_mtok: 12.5,
             cache_read_per_mtok: 1.0,
-            output_per_mtok: 60.0,
+            output_per_mtok: 50.0,
             source: "centaur_estimate:openai:gpt-6-astra:standard-short-context",
         });
     }
@@ -1894,6 +1905,7 @@ mod tests {
         for model in [
             "gpt-6-astra",
             "gpt-6.1-sol",
+            "gpt-6.1-terra",
             "gpt-6-sol",
             "gpt-6-luna",
             "gpt-5.6-sol",

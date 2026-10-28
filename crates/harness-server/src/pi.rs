@@ -50,6 +50,7 @@ const MODELS: &[(&str, &str)] = &[
     ("openai", "gpt-6-astra"),
     ("openai", "gpt-6-luna"),
     ("openai", "gpt-6-sol"),
+    ("openai", "gpt-6.1-sol"),
 ];
 const THINKING_LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 

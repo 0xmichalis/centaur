@@ -380,7 +380,7 @@ describe('normalizeHarnessOverrides', () => {
 })
 
 describe('validateStrategyOverrides', () => {
-  for (const model of ['gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna']) {
+  for (const model of ['gpt-6.1-sol', 'gpt-6.1-terra', 'gpt-6-sol', 'gpt-6-luna']) {
     test(`accepts ${model} and routes it to Codex`, () => {
       expect(validateStrategyOverrides({ model, reasoning: 'max' })).toEqual({
         harnessType: 'codex',
@@ -825,10 +825,13 @@ describe('messageOverridesForText strategy invocation', () => {
     expect(requestBody?.instructions).toContain('sol -> gpt-6.1-sol')
     expect(requestBody?.instructions).toContain('6 sol -> gpt-6-sol')
     expect(requestBody?.instructions).toContain('luna -> gpt-6-luna')
+    expect(requestBody?.instructions).toContain('terra -> gpt-6.1-terra')
+    expect(requestBody?.instructions).toContain('5.6 terra -> gpt-5.6-terra')
     const format = (requestBody?.text as {
       format: { schema: { properties: { model: { enum: (string | null)[] } } } }
     }).format
     expect(format.schema.properties.model.enum).toContain('gpt-6.1-sol')
+    expect(format.schema.properties.model.enum).toContain('gpt-6.1-terra')
     expect(format.schema.properties.model.enum).toContain('gpt-6-sol')
     expect(format.schema.properties.model.enum).toContain('gpt-6-luna')
     expect(format.schema.properties.model.enum).toContain('gpt-5.6-sol')
