@@ -3030,6 +3030,7 @@ async function renderExecutionStream(
     phase_ms: elapsedMs(titleStartedAtMs)
   })
   const capture = { diverged: false }
+  const answerStream: AnswerStreamProgress = { started: false }
   let visibleStream: FirstChunkStream | null = null
   try {
     const taskDisplayMode = slackStreamTaskDisplayMode(options)
@@ -3038,10 +3039,18 @@ async function renderExecutionStream(
         slackSafeChatSdkStream(
           slackVisibleChatSdkStream(
             harnessToChatSdkStream(
-              restoreAssistantStatusAfterSteering(thread, stream, statusTracker, options, trace),
+              restoreAssistantStatusAfterSteering(
+                thread,
+                stream,
+                statusTracker,
+                options,
+                trace,
+                answerStream
+              ),
               rendererOptions(thread, options, capture, trace, statusTracker)
             ),
-            taskDisplayMode
+            taskDisplayMode,
+            answerStream
           )
         )
       )
@@ -3089,6 +3098,7 @@ async function renderRecoveredExecutionStream(
     phase_ms: elapsedMs(titleStartedAtMs)
   })
   const capture = { diverged: false }
+  const answerStream: AnswerStreamProgress = { started: false }
   let visibleStream: FirstChunkStream | null = null
   try {
     const taskDisplayMode = slackStreamTaskDisplayMode(options)
@@ -3097,10 +3107,18 @@ async function renderRecoveredExecutionStream(
         slackSafeChatSdkStream(
           slackVisibleChatSdkStream(
             harnessToChatSdkStream(
-              restoreAssistantStatusAfterSteering(thread, stream, statusTracker, options, trace),
+              restoreAssistantStatusAfterSteering(
+                thread,
+                stream,
+                statusTracker,
+                options,
+                trace,
+                answerStream
+              ),
               rendererOptions(thread, options, capture, trace, statusTracker)
             ),
-            taskDisplayMode
+            taskDisplayMode,
+            answerStream
           )
         )
       )
@@ -3264,12 +3282,17 @@ function slackStreamTaskDisplayMode(options: SlackbotV2Options): SlackStreamTask
   return options.streamTaskDisplayMode ?? (options.activitySummaryStatusEnabled ? 'none' : 'plan')
 }
 
+/** Marks when the streamed answer message has visible content. */
+type AnswerStreamProgress = { started: boolean }
+
 async function* slackVisibleChatSdkStream(
   stream: AsyncIterable<ChatSDKStreamChunk>,
-  taskDisplayMode: SlackStreamTaskDisplayMode
+  taskDisplayMode: SlackStreamTaskDisplayMode,
+  answerStream: AnswerStreamProgress
 ): AsyncIterable<ChatSDKStreamChunk> {
   for await (const chunk of stream) {
     if (taskDisplayMode === 'none' && chunk.type !== 'markdown_text') continue
+    answerStream.started = true
     yield chunk
   }
 }
@@ -4151,11 +4174,21 @@ async function* restoreAssistantStatusAfterSteering(
   stream: AsyncIterable<SlackbotV2RendererSource>,
   tracker: AssistantStatusTracker,
   options: SlackbotV2Options,
-  trace?: SlackbotV2Trace
+  trace?: SlackbotV2Trace,
+  /** Absent when the answer is posted only after the stream ends. */
+  answerStream?: AnswerStreamProgress
 ): AsyncIterable<SlackbotV2RendererSource> {
   for await (const event of stream) {
     if (sessionEventKind(event) === SESSION_PROGRESS_UPDATE_EVENT) {
-      await postProgressUpdate(thread, event, tracker, options, trace)
+      // A message posted now would land below the answer, which is already
+      // streaming into an earlier message.
+      if (answerStream?.started) {
+        traceLog(options, 'slackbotv2_progress_update_skipped_answer_streaming', trace, {
+          event_id: 'eventId' in event ? event.eventId : undefined
+        })
+      } else {
+        await postProgressUpdate(thread, event, tracker, options, trace)
+      }
       continue
     }
     const steeringEvent = steeringEventKind(event)
