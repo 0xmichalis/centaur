@@ -417,6 +417,8 @@ export type ForwardSessionInput = {
   generativeUiNote?: string
   executionId?: string
   executeMessage?: SlackbotV2ApiMessage
+  /** The request an earlier attempt of this turn built, sent again as it was. */
+  executeRequest?: SlackbotV2ExecuteSessionRequest
   /** Effective harness selected by sticky thread flags or channel defaults. */
   harnessType?: string
   /** Harness persisted by api-rs. */

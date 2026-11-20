@@ -125,6 +125,7 @@ import type {
   SlackbotV2AppendSteering,
   SlackbotV2BlockActionPayload,
   SlackbotV2ApiMessage,
+  SlackbotV2ExecuteSessionRequest,
   SlackbotV2ExecuteSessionResponse,
   SlackbotV2MessageMode,
   SlackbotV2PendingTurn,
@@ -1734,6 +1735,10 @@ function pendingTurnsKey(threadId: string): string {
   return `slackbotv2:pending-turns:${threadId}`
 }
 
+function pendingTurnRequestKey(threadId: string, messageId: string): string {
+  return `slackbotv2:pending-turn:request:${threadId}:${messageId}`
+}
+
 function pendingTurnDoneKey(threadId: string, messageId: string): string {
   return `slackbotv2:pending-turn:done:${threadId}:${messageId}`
 }
@@ -1785,6 +1790,7 @@ async function retirePendingTurn(
   messageId: string
 ): Promise<void> {
   await state.set(pendingTurnDoneKey(threadId, messageId), true, PENDING_TURN_TTL_MS)
+  await state.delete(pendingTurnRequestKey(threadId, messageId))
 }
 
 /**
@@ -2358,8 +2364,17 @@ async function syncThreadMessageToSession(
     && state.generativeUiNoteSent !== generativeUiNoteFingerprint(pendingGenerativeUiNote)
       ? pendingGenerativeUiNote
       : undefined
+  // A rerun of a pending turn sends the request its first attempt built, so
+  // it does not depend on Slack still serving the message's files.
+  const pendingRequestKey =
+    input.pendingTurn && shouldStartExecution
+      ? pendingTurnRequestKey(thread.id, message.id)
+      : undefined
   const forwardInput: ForwardSessionInput = {
     afterEventId: lastEventId,
+    executeRequest: pendingRequestKey
+      ? (await input.state.get<SlackbotV2ExecuteSessionRequest>(pendingRequestKey)) ?? undefined
+      : undefined,
     executeContextMessages:
       shouldStartExecution && shouldIncludeContext ? candidateMessages : undefined,
     executeMessage: shouldStartExecution ? serializedMessage : undefined,
@@ -2587,6 +2602,9 @@ async function syncThreadMessageToSession(
         stoppedBeforeExecute = stopRequestedFor(latest, message)
           || (input.proactive === true && proactiveMuted(latest))
         return !stoppedBeforeExecute
+      },
+      beforeExecute: async request => {
+        if (pendingRequestKey) await input.state.set(pendingRequestKey, request, PENDING_TURN_TTL_MS)
       },
       onExecutionStarted: commitExecutionStarted,
       onMessagesAppended: commitMessagesAppended,

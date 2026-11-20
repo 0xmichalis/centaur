@@ -1896,6 +1896,32 @@ describe('slackbotv2', () => {
     expect(appended).toContain(Buffer.from('captured-image').toString('base64'))
   })
 
+  it('retries a late file with its first request after Slack stops serving the file', async () => {
+    let fileGone = false
+    bot = createTestBot({
+      handoffRetryDelaysMs: [50],
+      fetch: async (input, init) => {
+        const url = new URL(String(input instanceof Request ? input.url : input))
+        if (fileGone && url.pathname.endsWith('/captured.png')) {
+          return new Response('gone', { status: 404 })
+        }
+        return fixtureFetch(input, init)
+      }
+    })
+    const mention = await sendMessage(`<@${BOT_USER_ID}> a file will follow`)
+    await mention.finished()
+
+    codexApi.failNextExecute = true
+    const file = await deliverEvent(lateFileEvent(mention.ts))
+    await waitFor(() => codexApi.executes.length === 2, 3000)
+    fileGone = true
+    await file.finished()
+    await waitFor(() => codexApi.executes.length === 3, 3000)
+
+    expect(JSON.stringify(codexApi.executes[1]!.body)).toContain('dataBase64')
+    expect(codexApi.executes[2]!.body).toEqual(codexApi.executes[1]!.body)
+  })
+
   describe.skipIf(!process.env.SLACKBOTV2_TEST_DATABASE_URL)('late files on Postgres state', () => {
     async function replicaStates() {
       const url = process.env.SLACKBOTV2_TEST_DATABASE_URL!
