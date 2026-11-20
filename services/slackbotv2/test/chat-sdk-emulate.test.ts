@@ -290,6 +290,62 @@ describe('slackbotv2', () => {
     })
   })
 
+  it('does not let a delayed stop response clear a newer execution', async () => {
+    const logs: CapturedLog[] = []
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+    let interruptStarted = false
+    let releaseInterrupt!: () => void
+    const heldInterrupt = new Promise<void>(resolve => { releaseInterrupt = resolve })
+    bot = createTestBot({
+      agentViewEnabled: true, state: sharedState, logger: captureLogger(logs),
+      fetch: async (input, init) => {
+        if (String(input).endsWith('/interrupt')) {
+          interruptStarted = true
+          await heldInterrupt
+          return Response.json({ ok: true, interrupted: true, execution_id: 'exe-1', thread_key: 'unused' })
+        }
+        return globalThis.fetch(input, init)
+      }
+    })
+    codexApi.autoRespond = false
+    const parent = await postUserMessage('Context before a delayed stop.')
+    const first = await sendMessage(`<@${BOT_USER_ID}> first run`, { threadTs: parent.ts })
+    const key = threadKey(parent.ts)
+    await waitFor(() => codexApi.eventRequests.length === 1)
+    const stop = await deliverEvent({
+      type: 'agent_session_stopped', channel: CHANNEL_ID, thread_ts: parent.ts,
+      streaming_message_ts: [], user: USER_ID
+    })
+    try {
+      await waitFor(() => interruptStarted)
+      codexApi.emitOutputLines(key, sampleCodexOutputLines('First run finished.'))
+      await first.finished()
+      // The emulator can allocate timestamps earlier in the current second;
+      // this turn was sent after the recorded stop, so give it that ordering.
+      const newerTs = ((Date.now() + 1_000) / 1000).toFixed(6)
+      const second = await sendMessage(`<@${BOT_USER_ID}> next run`, {
+        threadTs: parent.ts, event: { ts: newerTs }
+      })
+      await waitFor(() => codexApi.eventRequests.length === 2)
+      releaseInterrupt()
+      await stop.finished()
+      await waitFor(() => hasLog(logs, 'slackbotv2_stop_command_complete'))
+      expect(await sharedState.get(`thread-state:${key}`)).toMatchObject({
+        activeExecution: true,
+        activeTurnMessageId: newerTs,
+        renderObligation: { message: { id: newerTs } }
+      })
+      codexApi.emitOutputLines(key, sampleCodexOutputLines('Newer run finished.'))
+      await second.finished()
+      expect(await threadText(parent.ts)).toContain('Newer run finished.')
+    } finally {
+      releaseInterrupt()
+      await bot.drain(1_000)
+      await sharedState.disconnect()
+    }
+  })
+
   it('logs a failed native stop without failing the webhook', async () => {
     const logs: CapturedLog[] = []
     const sharedState = createMemoryState()

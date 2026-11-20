@@ -938,11 +938,16 @@ async function interruptThreadExecution(
     const response = await interruptSessionExecution(options, thread.id, reason)
     // With nothing interrupted, a handoff may still own this state.
     if (response.interrupted) {
-      await thread.setState({
-        activeExecution: false,
-        lastEventId: latest.lastEventId ?? latest.renderObligation?.afterEventId ?? 0,
-        renderObligation: null
-      })
+      // The interrupt can answer after its turn ended and a newer one began;
+      // that turn's state and obligation are not this stop's to clear.
+      const current = (await thread.state) ?? {}
+      if (current.activeTurnMessageId === latest.activeTurnMessageId) {
+        await thread.setState({
+          activeExecution: false,
+          lastEventId: current.lastEventId ?? current.renderObligation?.afterEventId ?? 0,
+          renderObligation: null
+        })
+      }
     }
     await setAssistantStatus(thread, '', options, trace)
     traceLog(options, 'slackbotv2_stop_command_complete', trace, {
