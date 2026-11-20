@@ -229,10 +229,11 @@ const POSTGRES_CONNECT_INITIAL_DELAY_MS = 250
 const POSTGRES_CONNECT_MAX_DELAY_MS = 10_000
 const HANDOFF_RETRY_DELAYS_MS: readonly number[] = [5_000, 30_000, 120_000]
 const LATE_SLACK_FILE_MATCH_WINDOW_MS = 15_000
-const LATE_SLACK_FILE_PENDING_TTL_MS = 60_000
-const LATE_SLACK_FILE_CONSUMED_TTL_MS = 5 * 60_000
-const LATE_SLACK_FILE_IDLE_WAIT_MS = 90_000
-const LATE_SLACK_FILE_IDLE_POLL_MS = 500
+// Mentions are bucketed by minute of their Slack timestamp. A bucket outlives
+// Slack's webhook redelivery, which can retry an event for several minutes.
+const LATE_SLACK_FILE_BUCKET_MS = 60_000
+const LATE_SLACK_FILE_PENDING_TTL_MS = 10 * 60_000
+const LATE_SLACK_FILE_PENDING_MAX = 20
 const LATE_SLACK_FILE_MESSAGE_TEXT = 'Late Slack file attachment for the previous message.'
 const SLACK_BLOCK_ACTION_DEDUPE_TTL_MS = 24 * 60 * 60 * 1000
 const SLACK_BLOCK_ACTION_LEASE_TTL_MS = 60 * 1000
@@ -258,12 +259,13 @@ const PROACTIVE_PENDING_MAX = 50
 // every message as a mention.
 const PROACTIVE_ELIGIBILITY_TRIGGERS = new Set(['new_mention', 'proactive', 'subscribed_message'])
 
-type PendingLateSlackFileMention = {
+/** A fileless mention kept in shared state so any replica can match its late file. */
+type LateSlackFileMention = {
   channel: string
-  message: ChatMessage
   mentionTs: string
   teamId: string
-  thread: Thread<SlackbotV2ThreadState>
+  threadId: string
+  threadTs: string
   user: string
 }
 
@@ -411,7 +413,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   Object.assign(chat, { detectMention: () => false })
   const background = createBackgroundWork()
   const steeringReactions = createSteeringReactionController(options)
-  const lateSlackFiles = createLateSlackFileRepair(options, state, steeringReactions)
+  const lateSlackFiles = createLateSlackFileRepair(chat, { options, state, steeringReactions })
   const stateConnectionStatus: StateConnectionStatus = { attempts: 0, connected: false }
   const stateConnected = ensureStateConnected(state, options, stateConnectionStatus)
   backgroundWaitUntil(stateConnected)
@@ -534,7 +536,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
         text: message.text,
         threadId
       })
-      lateSlackFiles.rememberFilelessMention(thread, directMessage)
+      await lateSlackFiles.rememberFilelessMention(thread, directMessage)
       await handleSlackMessageHandoff(thread, directMessage, {
         assistantStatusRequested: true,
         mode: 'execute',
@@ -549,7 +551,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
 
   chat.onNewMention(async (thread, message) => {
     if (!(await isAllowedSlackMessage(message, options, logger))) return
-    lateSlackFiles.rememberFilelessMention(thread, message)
+    await lateSlackFiles.rememberFilelessMention(thread, message)
     await handleSlackMessageHandoff(thread, message, {
       assistantStatusRequested: true,
       mode: 'execute',
@@ -628,7 +630,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
       )
       return
     }
-    lateSlackFiles.rememberFilelessMention(thread, message)
+    await lateSlackFiles.rememberFilelessMention(thread, message)
     await handleSlackMessageHandoff(thread, message, {
       assistantStatusRequested: true,
       mode: 'execute',
@@ -779,8 +781,11 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
           return new globalThis.Response('Workflow action could not be recorded. Please retry.', { status: 503 })
         }
       }
-      const lateFileTask = response.ok ? lateSlackFiles.repairFromWebhook(rawBody) : null
-      if (lateFileTask) keepAlive(lateFileTask)
+      // Queued before the acknowledgement: a state failure fails the webhook
+      // and Slack redelivers the file event.
+      if (response.ok) {
+        await requestContext.run(context, () => lateSlackFiles.repairFromWebhook(rawBody))
+      }
       outcome = response.ok ? 'success' : 'error'
       return new globalThis.Response(await response.text(), {
         headers: response.headers,
@@ -1878,6 +1883,8 @@ async function runPendingTurns(
         continue
       }
       const message = chatMessageFromPendingTurn(next, options)
+      // A files.info failure throws before anything is shown; the turn stays queued.
+      await hydrateSlackFileInfo(message, options)
       const proactiveRule = next.proactiveRuleName
         ? resolveProactivityRules(options.proactivity?.rules, thread.id)
           ?.find(rule => rule.name === next.proactiveRuleName)
@@ -4499,29 +4506,14 @@ function backgroundWaitUntil(promise: Promise<unknown>): void {
   void promise.catch(() => undefined)
 }
 
-function createLateSlackFileRepair(
-  options: SlackbotV2Options,
-  state: StateAdapter,
-  steeringReactions: SteeringReactionController
-) {
-  const pending = new Map<string, PendingLateSlackFileMention[]>()
-  const consumed = new Map<string, number>()
-
-  const cleanup = () => {
-    const cutoff = Date.now() - LATE_SLACK_FILE_PENDING_TTL_MS
-    for (const [key, entries] of pending) {
-      const fresh = entries.filter(entry => slackTsToMs(entry.mentionTs) >= cutoff)
-      if (fresh.length > 0) pending.set(key, fresh)
-      else pending.delete(key)
-    }
-    const consumedCutoff = Date.now() - LATE_SLACK_FILE_CONSUMED_TTL_MS
-    for (const [key, timestamp] of consumed) {
-      if (timestamp < consumedCutoff) consumed.delete(key)
-    }
-  }
-
+function createLateSlackFileRepair(chat: Chat, runner: PendingTurnRunner) {
+  const { options, state } = runner
   return {
-    rememberFilelessMention(thread: Thread<SlackbotV2ThreadState>, message: ChatMessage): void {
+    /** Best effort: losing a late file must not fail the mention it follows. */
+    async rememberFilelessMention(
+      thread: Thread<SlackbotV2ThreadState>,
+      message: ChatMessage
+    ): Promise<void> {
       if (message.isMention !== true) return
       const raw = slackRawRecord(message)
       if (slackFiles(raw).length > 0 || message.attachments.length > 0) return
@@ -4531,46 +4523,49 @@ function createLateSlackFileRepair(
       const mentionTs = stringField(raw.ts) || message.id
       if (!teamId || !channel || !user || !mentionTs) return
 
-      cleanup()
-      const key = lateSlackFilePendingKey(teamId, channel, user)
-      const entry: PendingLateSlackFileMention = {
+      const mention: LateSlackFileMention = {
         channel,
-        message,
         mentionTs,
         teamId,
-        thread,
+        threadId: thread.id,
+        threadTs: stringField(raw.thread_ts) || mentionTs,
         user
       }
-      const entries = [entry, ...(pending.get(key) ?? [])]
-        .filter(item => slackTsToMs(item.mentionTs) >= Date.now() - LATE_SLACK_FILE_PENDING_TTL_MS)
-        .slice(0, 20)
-      pending.set(key, entries)
-      traceLog(options, 'slackbotv2_late_file_pending_mention_recorded', undefined, {
+      const fields = {
         slack_channel: channel,
         slack_message_ts: mentionTs,
         slack_team_id: teamId,
         slack_user_id: user,
         thread_id: thread.id
-      })
+      }
+      try {
+        await state.appendToList(
+          lateSlackFileMentionsKey(teamId, channel, user, slackTsToMs(mentionTs)),
+          mention,
+          { maxLength: LATE_SLACK_FILE_PENDING_MAX, ttlMs: LATE_SLACK_FILE_PENDING_TTL_MS }
+        )
+      } catch (error) {
+        traceWarn(options, 'slackbotv2_late_file_pending_mention_failed', undefined, {
+          ...fields,
+          error: errorMessage(error)
+        })
+        return
+      }
+      traceLog(options, 'slackbotv2_late_file_pending_mention_recorded', undefined, fields)
     },
 
-    repairFromWebhook(rawBody: string): Promise<void> | null {
+    /**
+     * Queues a file-only message that follows a fileless mention as a pending
+     * turn, which runs once the thread is idle and survives a restart.
+     */
+    async repairFromWebhook(rawBody: string): Promise<void> {
       const payload = slackWebhookPayload(rawBody)
-      if (!payload) return null
+      if (!payload) return
       const event = slackWebhookEvent(payload)
-      if (!event || !isLateSlackFileEvent(event, options)) return null
-      cleanup()
+      if (!event || !isLateSlackFileEvent(event, options)) return
 
-      const dedupeKey = lateSlackFileDedupeKey(payload, event)
-      if (consumed.has(dedupeKey)) {
-        traceLog(options, 'slackbotv2_late_file_duplicate_skipped', undefined, {
-          dedupe_key: dedupeKey
-        })
-        return null
-      }
-
-      const match = matchLateSlackFileMention(pending, payload, event)
-      if (!match) {
+      const mention = await claimLateSlackFileMention(state, payload, event)
+      if (!mention) {
         traceLog(options, 'slackbotv2_late_file_no_match', undefined, {
           slack_channel: stringField(event.channel),
           slack_event_id: stringField(payload.event_id),
@@ -4579,115 +4574,48 @@ function createLateSlackFileRepair(
           slack_thread_ts: stringField(event.thread_ts),
           slack_user_id: stringField(event.user)
         })
-        return null
+        return
       }
 
-      consumed.set(dedupeKey, Date.now())
-      return repairLateSlackFileMessage(
-        options,
-        state,
-        steeringReactions,
-        match,
-        event
-      ).catch(error => {
-        traceWarn(options, 'slackbotv2_late_file_repair_failed', undefined, {
-          dedupe_key: dedupeKey,
-          error: errorMessage(error),
-          slack_channel: stringField(event.channel),
-          slack_message_ts: stringField(event.ts),
-          thread_id: match.thread.id
-        })
+      const thread = chat.thread(mention.threadId)
+      const message = lateSlackFileSyntheticMessage(mention, event)
+      const trace = createHandoffTrace(thread, message, 'execute')
+      await enqueuePendingTurn(thread, message, { ...runner, mode: 'execute' }, trace)
+      traceLog(options, 'slackbotv2_late_file_queued', trace, {
+        slack_channel: mention.channel,
+        slack_mention_ts: mention.mentionTs
       })
+      schedulePendingTurns(thread, runner, trace)
     }
   }
 }
 
-async function repairLateSlackFileMessage(
-  options: SlackbotV2Options,
-  state: StateAdapter,
-  steeringReactions: SteeringReactionController,
-  pending: PendingLateSlackFileMention,
-  event: Record<string, unknown>
-): Promise<void> {
-  const startedAtMs = nowMs()
-  const eventTs = stringField(event.ts)
-  const hydratedEvent = await hydrateLateSlackFileEvent(options, event)
-  const ready = await waitForThreadIdle(pending.thread, options, {
-    includeContext: true,
-    messageId: eventTs,
-    mode: 'execute',
-    openStream: true,
-    startedAtMs: nowMs(),
-    threadId: pending.thread.id
-  })
-  if (!ready) {
-    traceWarn(options, 'slackbotv2_late_file_repair_idle_timeout', undefined, {
-      slack_channel: pending.channel,
-      slack_message_ts: eventTs,
-      thread_id: pending.thread.id
-    })
-    return
-  }
-
-  const message = lateSlackFileSyntheticMessage(pending, hydratedEvent)
-  await handleSlackMessageHandoff(pending.thread, message, {
-    assistantStatusRequested: true,
-    mode: 'execute',
-    options,
-    state,
-    steeringReactions,
-    trigger: 'late_file_message'
-  })
-  traceLog(options, 'slackbotv2_late_file_repair_complete', undefined, {
-    phase_ms: elapsedMs(startedAtMs),
-    slack_channel: pending.channel,
-    slack_message_ts: eventTs,
-    thread_id: pending.thread.id
-  })
-}
-
-async function waitForThreadIdle(
-  thread: Thread<SlackbotV2ThreadState>,
-  options: SlackbotV2Options,
-  trace: SlackbotV2Trace
-): Promise<boolean> {
-  const startedAtMs = nowMs()
-  while (elapsedMs(startedAtMs) < LATE_SLACK_FILE_IDLE_WAIT_MS) {
-    const latest = (await thread.state) ?? {}
-    if (latest.activeExecution !== true) return true
-    traceLog(options, 'slackbotv2_late_file_repair_waiting_for_idle', trace, {
-      waited_ms: elapsedMs(startedAtMs)
-    })
-    await sleep(LATE_SLACK_FILE_IDLE_POLL_MS)
-  }
-  return false
-}
-
 function lateSlackFileSyntheticMessage(
-  pending: PendingLateSlackFileMention,
+  mention: LateSlackFileMention,
   event: Record<string, unknown>
 ): ChatMessage {
-  const eventTs = stringField(event.ts) || randomUUID()
+  const eventTs = stringField(event.ts)
+  const user = stringField(event.user) || mention.user
+  const text = stringField(event.text).trim() ? stringField(event.text) : LATE_SLACK_FILE_MESSAGE_TEXT
   const raw: Record<string, unknown> = {
     ...event,
-    channel: pending.channel,
-    team: stringField(event.team) || pending.teamId,
-    team_id: stringField(event.team_id) || pending.teamId,
-    text: stringField(event.text) || LATE_SLACK_FILE_MESSAGE_TEXT,
-    thread_ts: stringField(event.thread_ts) || pending.mentionTs,
+    channel: mention.channel,
+    team: stringField(event.team) || mention.teamId,
+    team_id: stringField(event.team_id) || mention.teamId,
+    text,
+    thread_ts: stringField(event.thread_ts) || mention.mentionTs,
     ts: eventTs
   }
   return new ChatSdkMessage({
     attachments: [],
     author: {
-      ...pending.message.author,
-      userId: stringField(event.user) || pending.user,
-      userName: stringField(event.user) || pending.user,
-      fullName: stringField(event.user) || pending.user,
+      userId: user,
+      userName: user,
+      fullName: user,
       isBot: Boolean(event.bot_id),
       isMe: false
     },
-    formatted: parseMarkdown(LATE_SLACK_FILE_MESSAGE_TEXT),
+    formatted: parseMarkdown(text),
     id: eventTs,
     isMention: true,
     links: [],
@@ -4696,32 +4624,30 @@ function lateSlackFileSyntheticMessage(
       edited: false
     },
     raw,
-    text: LATE_SLACK_FILE_MESSAGE_TEXT,
-    threadId: pending.thread.id
+    text,
+    threadId: mention.threadId
   })
 }
 
-async function hydrateLateSlackFileEvent(
-  options: SlackbotV2Options,
-  event: Record<string, unknown>
-): Promise<Record<string, unknown>> {
-  const files = slackFiles(event)
-  if (!files.some(file => stringField(file.file_access) === 'check_file_info')) return event
+/**
+ * Slack Connect files arrive as `check_file_info` placeholders. Raw files
+ * only stand in for attachments when the adapter attached none.
+ */
+async function hydrateSlackFileInfo(message: ChatMessage, options: SlackbotV2Options): Promise<void> {
+  if (message.attachments.length > 0) return
+  const raw = slackRawRecord(message)
+  const files = slackFiles(raw)
+  if (!files.some(file => stringField(file.file_access) === 'check_file_info')) return
   const hydratedFiles: Record<string, unknown>[] = []
   for (const file of files) {
-    if (stringField(file.file_access) !== 'check_file_info') {
-      hydratedFiles.push(file)
-      continue
-    }
     const id = stringField(file.id)
-    if (!id) {
-      hydratedFiles.push(file)
-      continue
-    }
-    const hydrated = await slackFilesInfo(options, id)
+    const hydrated =
+      id && stringField(file.file_access) === 'check_file_info'
+        ? await slackFilesInfo(options, id)
+        : null
     hydratedFiles.push(hydrated ?? file)
   }
-  return { ...event, files: hydratedFiles }
+  raw.files = hydratedFiles
 }
 
 async function slackFilesInfo(
@@ -4747,27 +4673,61 @@ async function slackFilesInfo(
   return payload.file as Record<string, unknown>
 }
 
-function matchLateSlackFileMention(
-  pending: Map<string, PendingLateSlackFileMention[]>,
+function lateSlackFileMentionsKey(
+  teamId: string,
+  channel: string,
+  user: string,
+  timeMs: number
+): string {
+  const bucket = Math.floor(timeMs / LATE_SLACK_FILE_BUCKET_MS)
+  return `slackbotv2:late-file:mentions:${JSON.stringify([teamId, channel, user, bucket])}`
+}
+
+/**
+ * Finds the newest fileless mention this file event follows and claims it.
+ * A mention takes one file event, on whichever replica receives it; a
+ * redelivery of that event claims it again and the queue dedupes the turn.
+ */
+async function claimLateSlackFileMention(
+  state: StateAdapter,
   payload: Record<string, unknown>,
   event: Record<string, unknown>
-): PendingLateSlackFileMention | null {
+): Promise<LateSlackFileMention | null> {
   const teamId = slackEventTeamId(payload, event)
   const channel = stringField(event.channel)
   const user = stringField(event.user)
   const eventTs = stringField(event.ts)
   if (!teamId || !channel || !user || !eventTs) return null
 
-  const entries = pending.get(lateSlackFilePendingKey(teamId, channel, user)) ?? []
   const threadTs = stringField(event.thread_ts)
   const eventMs = slackTsToMs(eventTs)
-  return (
-    entries.find(entry => {
-      if (threadTs && threadTs !== slackThreadTsForPendingMention(entry)) return false
-      const mentionMs = slackTsToMs(entry.mentionTs)
-      return eventMs > mentionMs && eventMs - mentionMs <= LATE_SLACK_FILE_MATCH_WINDOW_MS
-    }) ?? null
+  // The mention may sit in the bucket before the file's.
+  const keys = new Set(
+    [eventMs, eventMs - LATE_SLACK_FILE_MATCH_WINDOW_MS].map(timeMs =>
+      lateSlackFileMentionsKey(teamId, channel, user, timeMs)
+    )
   )
+  const lists = await Promise.all(
+    [...keys].map(key => state.getList<LateSlackFileMention>(key))
+  )
+  const mentions = lists
+    .flat()
+    .filter(mention => {
+      if (threadTs && threadTs !== mention.threadTs) return false
+      const mentionMs = slackTsToMs(mention.mentionTs)
+      return eventMs > mentionMs && eventMs - mentionMs <= LATE_SLACK_FILE_MATCH_WINDOW_MS
+    })
+    .sort((a, b) => slackTsToMs(b.mentionTs) - slackTsToMs(a.mentionTs))
+  for (const mention of mentions) {
+    const key = `slackbotv2:late-file:claim:${JSON.stringify([teamId, channel, user, mention.mentionTs])}`
+    if (
+      (await state.setIfNotExists(key, eventTs, PENDING_TURN_TTL_MS))
+      || (await state.get<string>(key)) === eventTs
+    ) {
+      return mention
+    }
+  }
+  return null
 }
 
 function isLateSlackFileEvent(
@@ -4791,36 +4751,11 @@ function slackWebhookEvent(payload: Record<string, unknown>): Record<string, unk
   return isJsonObject(payload.event) ? (payload.event as Record<string, unknown>) : null
 }
 
-function lateSlackFilePendingKey(teamId: string, channel: string, user: string): string {
-  return `${teamId}:${channel}:${user}`
-}
-
-function lateSlackFileDedupeKey(
-  payload: Record<string, unknown>,
-  event: Record<string, unknown>
-): string {
-  const eventId = stringField(payload.event_id)
-  if (eventId) return `event:${eventId}`
-  const fileIds = slackFiles(event).map(file => stringField(file.id)).filter(Boolean).join(',')
-  return [
-    'file',
-    slackEventTeamId(payload, event),
-    stringField(event.channel),
-    stringField(event.ts),
-    fileIds
-  ].join(':')
-}
-
 function slackEventTeamId(
   payload: Record<string, unknown>,
   event: Record<string, unknown>
 ): string {
   return stringField(event.team) || stringField(event.team_id) || stringField(payload.team_id)
-}
-
-function slackThreadTsForPendingMention(entry: PendingLateSlackFileMention): string {
-  const raw = slackRawRecord(entry.message)
-  return stringField(raw.thread_ts) || entry.mentionTs
 }
 
 function slackTsToMs(ts: string): number {

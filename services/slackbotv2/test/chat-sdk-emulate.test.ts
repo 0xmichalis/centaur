@@ -1,4 +1,4 @@
-import { createHmac } from 'node:crypto'
+import { createHmac, randomUUID } from 'node:crypto'
 import {
   createServer,
   request as httpRequest,
@@ -11,6 +11,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, spyOn } from 'bu
 import { WebClient } from '@slack/web-api'
 import { createEmulator, type Emulator } from 'emulate'
 import { createMemoryState } from '@chat-adapter/state-memory'
+import { createPostgresState } from '@chat-adapter/state-pg'
 import { Message as ChatSdkMessage, type StateAdapter } from 'chat'
 import type { ServerNotification } from '@centaur/harness-events'
 import {
@@ -1626,6 +1627,292 @@ describe('slackbotv2', () => {
 
     expect(codexApi.executes).toHaveLength(2)
     expect(codexApi.executes[1]!.body.idempotency_key).toBe(incrementSlackTs(mention.ts, 3))
+  })
+
+  function lateFileEvent(mentionTs: string, fields: Record<string, unknown> = {}) {
+    return {
+      type: 'message',
+      user: USER_ID,
+      channel: CHANNEL_ID,
+      team: TEAM_ID,
+      ts: incrementSlackTs(mentionTs, 2),
+      text: '',
+      files: [
+        {
+          id: 'F-late',
+          mimetype: 'image/png',
+          name: 'late.png',
+          url_private: 'https://files.slack.com/files/captured.png'
+        }
+      ],
+      ...fields
+    }
+  }
+
+  async function deliverTo(instance: SlackbotV2, request: RequestInit): Promise<Response> {
+    const waits: Promise<unknown>[] = []
+    const response = await instance.app.request(
+      '/api/webhooks/slack',
+      request,
+      {},
+      waitUntilContext(waits)
+    )
+    await Promise.all(waits)
+    return response
+  }
+
+  /** A state whose list appends to keys with `prefix` fail `failures` times. */
+  async function stateFailingAppends(prefix: string, failures: number) {
+    const state = createMemoryState()
+    await state.connect()
+    let remaining = failures
+    const flaky = new Proxy(state, {
+      get(target, prop, receiver) {
+        if (prop !== 'appendToList') return Reflect.get(target, prop, receiver)
+        return async (key: string, value: unknown, options?: unknown) => {
+          if (key.startsWith(prefix) && remaining-- > 0) throw new Error('state unavailable')
+          return target.appendToList(key, value, options as never)
+        }
+      }
+    })
+    return { flaky, state }
+  }
+
+  it('keeps a late file caption and gives a mention one file event', async () => {
+    const state = createMemoryState()
+    await state.connect()
+    bot = createTestBot({ state })
+    const mention = await sendMessage(`<@${BOT_USER_ID}> a chart will follow`)
+    await mention.finished()
+    const key = threadKey(mention.ts)
+
+    const otherThread = await deliverEvent(
+      lateFileEvent(mention.ts, { thread_ts: incrementSlackTs(mention.ts, -60) })
+    )
+    await otherThread.finished()
+    expect(await pendingTurnIds(state, key)).toEqual([])
+    expect(codexApi.executes).toHaveLength(1)
+
+    const captioned = await deliverEvent(
+      lateFileEvent(mention.ts, { text: 'Compare the red and blue bars.' })
+    )
+    await captioned.finished()
+
+    expect(codexApi.executes).toHaveLength(2)
+    const input = codexApi.executes[1]!.body.input_lines.at(-1)!
+    expect(input).toContain('Compare the red and blue bars.')
+    expect(input).not.toContain('Late Slack file attachment')
+
+    const second = await deliverEvent(
+      lateFileEvent(mention.ts, { ts: incrementSlackTs(mention.ts, 3) })
+    )
+    await second.finished()
+    expect(await pendingTurnIds(state, key)).toEqual([])
+    expect(codexApi.executes).toHaveLength(2)
+  })
+
+  it('matches a late file across a minute boundary, within the window only', async () => {
+    const state = createMemoryState()
+    await state.connect()
+    bot = createTestBot({ state })
+    const text = `<@${BOT_USER_ID}> a file follows`
+    const minute = Math.floor(Number((await postUserMessage(text)).ts) / 60) * 60
+    const mentionAt = async (seconds: number) => {
+      const ts = `${seconds}.000100`
+      const mention = await deliverEvent({
+        type: 'app_mention', user: USER_ID, channel: CHANNEL_ID, team: TEAM_ID, ts, text
+      })
+      await mention.finished()
+      return ts
+    }
+
+    // Same minute as its mention, but past the window.
+    const early = await mentionAt(minute - 50)
+    const tooLate = await deliverEvent(
+      lateFileEvent(early, { ts: incrementSlackTs(early, 16) })
+    )
+    await tooLate.finished()
+    expect(await pendingTurnIds(state, threadKey(early))).toEqual([])
+    expect(codexApi.executes).toHaveLength(1)
+
+    // The last second of a minute, so the file lands in the next bucket.
+    const boundary = await mentionAt(minute - 1)
+    const inWindow = await deliverEvent(lateFileEvent(boundary))
+    await inWindow.finished()
+    expect(codexApi.executes).toHaveLength(3)
+    expect(codexApi.executes[2]!.threadKey).toBe(threadKey(boundary))
+    expect(codexApi.executes[2]!.body.idempotency_key).toBe(incrementSlackTs(boundary, 2))
+  })
+
+  it('queues a late file behind the running turn', async () => {
+    const state = createMemoryState()
+    await state.connect()
+    bot = createTestBot({ state })
+    codexApi.autoRespond = false
+
+    const mention = await sendMessage(`<@${BOT_USER_ID}> start before the file lands`)
+    await waitFor(() => codexApi.streamCount === 1)
+    const key = threadKey(mention.ts)
+    const fileTs = incrementSlackTs(mention.ts, 2)
+    const file = await deliverEvent(lateFileEvent(mention.ts))
+    expect(file.response.status).toBe(200)
+    await file.finished()
+    expect(codexApi.executes).toHaveLength(1)
+    expect(await pendingTurnIds(state, key)).toEqual([fileTs])
+
+    codexApi.autoRespond = true
+    codexApi.emitOutputLines(key, sampleCodexOutputLines('First execution complete.'))
+    await mention.finished()
+    await waitFor(() => codexApi.executes.length === 2, 3000)
+    expect(codexApi.executes[1]!.body.idempotency_key).toBe(fileTs)
+    await waitFor(async () => (await pendingTurnIds(state, key)).length === 0, 3000)
+  })
+
+  it('fails the webhook when a late file cannot be queued, and queues its redelivery', async () => {
+    const { flaky } = await stateFailingAppends('slackbotv2:pending-turns:', 1)
+    bot = createTestBot({ state: flaky })
+    const mention = await sendMessage(`<@${BOT_USER_ID}> a file will follow`)
+    await mention.finished()
+
+    const request = signedSlackEvent({
+      event_id: 'Ev-slackbotv2-late-file-unqueued',
+      event: lateFileEvent(mention.ts)
+    })
+    expect((await deliverTo(bot, request)).status).toBe(500)
+    expect(codexApi.executes).toHaveLength(1)
+
+    expect((await deliverTo(bot, request)).status).toBe(200)
+    expect(codexApi.executes).toHaveLength(2)
+    expect(codexApi.executes[1]!.body.idempotency_key).toBe(incrementSlackTs(mention.ts, 2))
+  })
+
+  it('answers a mention that could not be recorded for late files', async () => {
+    const logs: CapturedLog[] = []
+    const { flaky } = await stateFailingAppends('slackbotv2:late-file:mentions:', 1)
+    bot = createTestBot({ logger: captureLogger(logs), state: flaky })
+
+    const mention = await sendMessage(`<@${BOT_USER_ID}> answer despite the state error`)
+    expect(mention.response.status).toBe(200)
+    await mention.finished()
+
+    expect(codexApi.executes).toHaveLength(1)
+    expect(hasLog(logs, 'slackbotv2_late_file_pending_mention_failed')).toBe(true)
+  })
+
+  it('keeps a late file queued when files.info fails, and runs it on redelivery', async () => {
+    const state = createMemoryState()
+    await state.connect()
+    let failFileInfo = true
+    bot = createTestBot({
+      state,
+      fetch: async (input, init) => {
+        const url = new URL(input instanceof Request ? input.url : String(input))
+        if (failFileInfo && url.pathname.endsWith('/files.info')) {
+          failFileInfo = false
+          return new Response('unavailable', { status: 503 })
+        }
+        return fixtureFetch(input, init)
+      }
+    })
+    const mention = await sendMessage(`<@${BOT_USER_ID}> inspect the shared file`)
+    await mention.finished()
+    slackApi.setFileInfo('F-late', {
+      id: 'F-late',
+      mimetype: 'image/png',
+      name: 'hydrated.png',
+      url_private: 'https://files.slack.com/files/captured.png'
+    })
+
+    const request = signedSlackEvent({
+      event_id: 'Ev-slackbotv2-late-file-info',
+      event: lateFileEvent(mention.ts, { files: [{ id: 'F-late', file_access: 'check_file_info' }] })
+    })
+    expect((await deliverTo(bot, request)).status).toBe(200)
+    expect(codexApi.executes).toHaveLength(1)
+    expect(await pendingTurnIds(state, threadKey(mention.ts))).toEqual([
+      incrementSlackTs(mention.ts, 2)
+    ])
+
+    expect((await deliverTo(bot, request)).status).toBe(200)
+    expect(codexApi.executes).toHaveLength(2)
+    const appended = JSON.stringify(codexApi.appends.at(-1)!.body.messages)
+    expect(appended).toContain('hydrated.png')
+    expect(appended).toContain(Buffer.from('captured-image').toString('base64'))
+  })
+
+  describe.skipIf(!process.env.SLACKBOTV2_TEST_DATABASE_URL)('late files on Postgres state', () => {
+    async function replicaStates() {
+      const url = process.env.SLACKBOTV2_TEST_DATABASE_URL!
+      if (!['localhost', '127.0.0.1'].includes(new URL(url).hostname)) {
+        throw new Error('Late-file Postgres tests require a local test database')
+      }
+      const keyPrefix = `late-file-test-${randomUUID()}`
+      const first = createPostgresState({ url, keyPrefix })
+      const second = createPostgresState({ url, keyPrefix })
+      // One at a time: the first connection creates the schema.
+      await first.connect()
+      await second.connect()
+      return [first, second] as const
+    }
+
+    it('matches a late file on another replica once', async () => {
+      const [first, second] = await replicaStates()
+      const replica = createTestBot({ state: second })
+      try {
+        bot = createTestBot({ state: first })
+        const mention = await sendMessage(`<@${BOT_USER_ID}> inspect the file on any replica`)
+        await mention.finished()
+
+        const request = signedSlackEvent({
+          event_id: 'Ev-slackbotv2-late-file-replica',
+          event: lateFileEvent(mention.ts)
+        })
+        expect((await deliverTo(replica, request)).status).toBe(200)
+        await waitFor(() => codexApi.executes.length === 2, 5000)
+        expect(codexApi.executes[1]!.threadKey).toBe(threadKey(mention.ts))
+        expect(codexApi.executes[1]!.body.idempotency_key).toBe(incrementSlackTs(mention.ts, 2))
+
+        // Neither a redelivery nor a second file starts another turn.
+        expect((await deliverTo(bot, request)).status).toBe(200)
+        const other = signedSlackEvent({
+          event_id: 'Ev-slackbotv2-late-file-replica-second',
+          event: lateFileEvent(mention.ts, { ts: incrementSlackTs(mention.ts, 3) })
+        })
+        expect((await deliverTo(bot, other)).status).toBe(200)
+        expect(codexApi.executes).toHaveLength(2)
+      } finally {
+        await Promise.all([bot.drain(1000), replica.drain(1000)])
+        await Promise.all([first.disconnect(), second.disconnect()])
+      }
+    }, 30_000)
+
+    it('runs a queued late file after a restart', async () => {
+      const [first, second] = await replicaStates()
+      const instances: SlackbotV2[] = []
+      try {
+        bot = createTestBot({ state: first })
+        instances.push(bot)
+        codexApi.autoRespond = false
+        const mention = await sendMessage(`<@${BOT_USER_ID}> start before the restart`)
+        await waitFor(() => codexApi.streamCount === 1, 5000)
+        const key = threadKey(mention.ts)
+        const fileTs = incrementSlackTs(mention.ts, 2)
+        const file = await deliverEvent(lateFileEvent(mention.ts))
+        await file.finished()
+        expect(await pendingTurnIds(first, key)).toEqual([fileTs])
+
+        codexApi.autoRespond = true
+        bot = createTestBot({ state: second })
+        instances.push(bot)
+        codexApi.emitOutputLines(key, sampleCodexOutputLines('First execution complete.'))
+        await waitFor(() => codexApi.executes.length === 2, 15_000)
+        expect(codexApi.executes[1]!.body.idempotency_key).toBe(fileTs)
+        await waitFor(async () => (await pendingTurnIds(second, key)).length === 0, 10_000)
+      } finally {
+        await Promise.all(instances.map(instance => instance.drain(1000)))
+        await Promise.all([first.disconnect(), second.disconnect()])
+      }
+    }, 40_000)
   })
 
   it('fetches attachments from preceding Slack thread messages for a mid-thread mention', async () => {
@@ -6453,6 +6740,14 @@ function createTestBot(
   })
 }
 
+// slackbotv2 downloads files with the bot token only from Slack's file
+// origins, so serve files.slack.com from the emulator, as the adapter's
+// file transport does.
+function fixtureFetch(input: Parameters<typeof fetch>[0], init?: RequestInit): Promise<Response> {
+  const url = new URL(input instanceof Request ? input.url : String(input))
+  return fetch(url.hostname === 'files.slack.com' ? new URL(url.pathname, slackApi.url) : input, init)
+}
+
 function createProductionDefaultTestBot(
   overrides: Partial<Parameters<typeof createSlackbotV2>[0]> = {}
 ): SlackbotV2 {
@@ -6464,13 +6759,7 @@ function createProductionDefaultTestBot(
     signingSecret: SIGNING_SECRET,
     slackApiUrl,
     state: createMemoryState(),
-    // slackbotv2 downloads files with the bot token only from Slack's file
-    // origins, so serve files.slack.com from the emulator, as the adapter's
-    // file transport below does.
-    fetch: (input, init) => {
-      const url = new URL(input instanceof Request ? input.url : String(input))
-      return fetch(url.hostname === 'files.slack.com' ? new URL(url.pathname, slackApi.url) : input, init)
-    },
+    fetch: fixtureFetch,
     ...overrides
   })
   Object.assign(instance.chat.getAdapter('slack'), {
